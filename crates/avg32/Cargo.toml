@@ -1,0 +1,38 @@
+[package]
+name = "avg32"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+game_fs = { path = "../game_fs" }
+web-time = "1.1"
+anyhow.workspace = true
+chrono.workspace = true
+encoding_rs = "0.8"
+engine-detect = { path = "../engine-detect" }
+ab_glyph = "0.2"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+chrono = { workspace = true, features = ["wasmbind"] }
+cpal = { version = "0.15", features = ["wasm-bindgen"] }
+
+[features]
+desktop-player = ["dep:bytemuck", "dep:clap", "dep:pollster", "dep:wgpu", "dep:winit"]
+
+[target.'cfg(not(target_os = "horizon"))'.dependencies]
+kira.workspace = true
+oxideav-cinepak = { version = "0.0.3", default-features = false }
+bytemuck = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
+winit = { workspace = true, optional = true }
+
+[[bin]]
+name = "avg32_player"
+path = "src/bin/avg32_player.rs"
+required-features = ["desktop-player"]
+
+[lints]
+workspace = true

@@ -1,0 +1,1 @@
+Synthetic font test fixture: OFL-1.1 subset of NotoSansCJKsc-Regular.otf at notofonts/noto-cjk commit f8d157532fbfaeda587e826d4cd5b21a49186f7c. Contains A and hiragana a only, for exercising missing-Chinese-glyph fallback. No game data.

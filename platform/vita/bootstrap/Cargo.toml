@@ -1,0 +1,17 @@
+[package]
+name = "siglus_vita_bootstrap"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+
+# Keep the target probe independent of the desktop workspace's renderer and
+# audio dependency graph. It uses published bindings, not copied SDK code.
+[workspace]
+
+[package.metadata.vita]
+title_id = "SIGVITA01"
+title_name = "Siglus Vita Bootstrap"
+build_std = "std,panic_abort"
+
+[target.'cfg(target_os = "vita")'.dependencies]
+vitasdk-sys = { version = "=0.3.3", default-features = false, features = ["SceCtrl_stub", "SceDisplay_stub", "SceSysmem_stub"] }

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Game Library</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div id="app">
+    <section id="library-screen">
+      <header id="header">
+        <div id="brand">
+          <div id="brand-title">Game Library</div>
+          <div id="brand-sub">SiglusEngine · RealLive · AVG32 · UK2</div>
+        </div>
+        <div id="header-spacer"></div>
+        <input id="search" type="search" placeholder="Search" autocomplete="off" />
+        <label class="button secondary" for="font-file" title="Add a font for game text (CJK fonts recommended)">Add Font</label>
+        <input id="font-file" class="hidden-input" type="file" accept=".ttf,.otf,.ttc" multiple />
+        <label class="button" for="game-dir">+ Import Folder</label>
+        <input id="game-dir" class="hidden-input" type="file" webkitdirectory multiple />
+      </header>
+
+      <div id="status-line"></div>
+      <div id="error-box"></div>
+
+      <main id="game-scroll">
+        <div id="game-grid"></div>
+        <div id="unsupported"></div>
+        <div id="empty-card" class="empty-card">
+          <div class="empty-icon">▦</div>
+          <h1>No games yet</h1>
+          <p>Import a game folder, or a folder that contains several games — or drop folders onto this page.</p>
+          <p class="muted">The engine is detected automatically. Covers come from the game's artwork or its icon.<br />
+            Files stay on your computer; the browser only reads what you choose.</p>
+          <label class="button" for="game-dir">Import Folder</label>
+        </div>
+      </main>
+
+      <div id="drop-zone"><div>Drop game folders to import</div></div>
+    </section>
+
+    <section id="player-screen">
+      <canvas id="siglus-canvas" tabindex="0"></canvas>
+      <div id="player-bar">
+        <div id="player-title"></div>
+        <button id="skip-button" class="secondary" title="Skip (Ctrl)">» Skip</button>
+        <button id="menu-button" class="secondary" title="Menu (right click)">≡ Menu</button>
+        <button id="exit-button">Exit</button>
+      </div>
+    </section>
+
+    <div id="launch-overlay">
+      <div id="launch-card">
+        <div class="spinner"></div>
+        <div id="launch-text">Loading…</div>
+      </div>
+    </div>
+
+    <dialog id="report-dialog">
+      <h2 id="report-title"></h2>
+      <pre id="report-body"></pre>
+      <div class="dialog-actions">
+        <label id="report-more" class="button secondary" for="game-dir">Import More</label>
+        <button id="report-ok">OK</button>
+      </div>
+    </dialog>
+  </div>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

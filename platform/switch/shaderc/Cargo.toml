@@ -1,0 +1,13 @@
+[package]
+name = "siglus_switch_shaderc"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+publish = false
+
+[workspace]
+
+# The same naga as wgpu 0.20 (the desktop renderer), so the WGSL is read
+# exactly as the desktop reads it.
+[dependencies]
+naga = { version = "0.20", features = ["wgsl-in", "glsl-out"] }

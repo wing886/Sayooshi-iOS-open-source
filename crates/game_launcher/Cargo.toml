@@ -1,0 +1,40 @@
+[package]
+name = "game_launcher"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Shared launcher layer for the app builds: engine detection, titles, covers and a common runtime for SiglusEngine, RealLive, AVG32 and UK2"
+
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+encoding_rs = "0.8"
+image = { workspace = true, features = ["ico"] }
+engine-detect = { path = "../engine-detect" }
+game_fs = { path = "../game_fs" }
+avg32 = { path = "../avg32" }
+reallive = { path = "../reallive" }
+siglus_scene_vm = { path = "../siglus_scene_vm" }
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+uk2 = { path = "../uk2" }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+winit.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+
+[[bin]]
+name = "game_launcher_run"
+path = "src/bin/game_launcher_run.rs"
+required-features = []
+
+[lints]
+workspace = true

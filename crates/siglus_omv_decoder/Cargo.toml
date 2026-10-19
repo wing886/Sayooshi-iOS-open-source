@@ -1,0 +1,17 @@
+[package]
+name = "siglus_omv_decoder"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+name = "siglus_omv_decoder"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { version = "1", default-features = false }
+theora-rs = { path = "../theora-rs" }
+ogg = "0.9.2"
+lewton = "0.10.2"
+
+[lints]
+workspace = true

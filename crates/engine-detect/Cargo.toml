@@ -1,0 +1,16 @@
+[package]
+name = "engine-detect"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Identifies which engine (SiglusEngine, RealLive, AVG32 or UK2) a game directory uses"
+
+[dependencies]
+game_fs = { path = "../game_fs" }
+
+[[bin]]
+name = "engine_detect"
+path = "src/bin/engine_detect.rs"
+
+[lints]
+workspace = true

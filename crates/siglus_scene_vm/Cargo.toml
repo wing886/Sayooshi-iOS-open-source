@@ -1,0 +1,89 @@
+[package]
+name = "siglus_scene_vm"
+version = "1.0.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[features]
+# Replaces the monotonic clock with one advanced by hand
+# (`platform_time::advance_virtual_clock`), for deterministic replays of the
+# VM (examples/vm_replay.rs). Never enable it in a player.
+virtual-clock = []
+
+[dependencies]
+rustc-hash = "2"
+anyhow.workspace = true
+clap.workspace = true
+bytemuck.workspace = true
+image = { workspace = true, features = ["ico"] }
+log.workspace = true
+env_logger.workspace = true
+chrono.workspace = true
+ab_glyph = "0.2.32"
+ttf-parser = "0.25.1"
+encoding_rs = "0.8"
+eluna = { package = "eluna_rs", version = "0.1.0", path = "../../vendor/eluna_rs" }
+siglus_omv_decoder = { path = "../siglus_omv_decoder" }
+na_mpeg2_decoder = { path = "../na_mpeg2_decoder" }
+wmv_decoder = { package = "wmv-decoder", path = "../na_wmv_player" }
+siglus_key_recovery = { path = "../siglus_key_recovery" }
+
+siglus_assets = { path = "../siglus_assets" }
+shion-xfile = { path = "../shion-xfile" }
+
+[[bin]]
+name = "siglus_engine"
+path = "src/bin/siglus_engine.rs"
+
+[[bin]]
+name = "mesh_asset_tool"
+path = "src/bin/mesh_asset_tool.rs"
+
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+serde_json = "1"
+
+[target.'cfg(not(any(target_os = "horizon", target_os = "vita")))'.dependencies]
+kira.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+pollster.workspace = true
+raw-window-handle = "0.6"
+egui = "0.28.1"
+egui-wgpu = "0.28.1"
+
+[target.'cfg(all(not(any(target_os = "horizon", target_os = "vita")), not(all(target_arch = "wasm32", target_os = "unknown"))))'.dependencies]
+ureq = "2.10"
+
+[target.'cfg(target_os = "horizon")'.dependencies]
+getrandom_03 = { package = "getrandom", version = "0.3.4" }
+kira = { version = "0.9", default-features = false, features = ["mp3", "ogg", "flac", "wav"] }
+
+[target.'cfg(target_os = "vita")'.dependencies]
+kira = { version = "0.9", default-features = false, features = ["mp3", "ogg", "flac", "wav"] }
+vitasdk-sys = { version = "=0.3.3", default-features = false, features = ["SceGxm_stub", "SceSysmem_stub"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+ndk-context = "0.1.1"
+android_logger = "0.14"
+winit = { workspace = true, features = ["android-game-activity"] }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+wgpu = { workspace = true, features = ["webgl"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["console", "Window", "Document", "Element", "HtmlCanvasElement", "HtmlElement"] }
+web-time = "1.1"
+console_error_panic_hook = "0.1"
+getrandom_02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3.4", features = ["wasm_js"] }
+
+[lints]
+workspace = true
+
+[[example]]
+name = "vm_replay"
+required-features = ["virtual-clock"]

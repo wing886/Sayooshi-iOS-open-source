@@ -1,0 +1,57 @@
+name: Build fixed AVG32 unsigned iOS IPA
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ios-engine-build
+  cancel-in-progress: false
+jobs:
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: 3
+      IPHONEOS_DEPLOYMENT_TARGET: '14.0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Audit source tree
+        run: python3 tools/ci/audit_index.py > index-audit.json
+      - name: Install pinned toolchain and XcodeGen
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          command -v xcodegen || brew install xcodegen
+          rustc --version
+          xcodebuild -version
+      - name: AVG32 regression tests
+        run: cargo test --locked -p avg32 --lib
+      - name: Record the exact modified source
+        run: |
+          python3 tools/ci/provenance.py
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 1.0.1" platform/ios/SiglusLauncher/SiglusLauncher/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GITHUB_RUN_NUMBER" platform/ios/SiglusLauncher/SiglusLauncher/Info.plist
+      - name: Compile fresh arm64 device and simulator libraries
+        run: bash platform/scripts/build_ios_xcframework.sh
+      - name: Build unsigned app and IPA
+        run: bash platform/scripts/package_ios_altstore_ipa.sh
+      - name: Verify device architecture and provenance
+        run: |
+          python3 tools/ci/verify_ipa.py dist/ios/SiglusLauncher.ipa --commit "$GITHUB_SHA" > dist/ios/verification.json
+          cp platform/ios/SiglusLauncher/SiglusLauncher/Resources/BuildProvenance.json dist/ios/source-provenance.json
+          shasum -a 256 dist/ios/SiglusLauncher.ipa > dist/ios/SHA256SUMS
+          test "$(find dist/ios/build/Payload -name Siglus -type f | head -1 | xargs lipo -archs)" = arm64
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: SiglusLauncher-fixed-unsigned
+          retention-days: 3
+          if-no-files-found: error
+          path: |
+            dist/ios/SiglusLauncher.ipa
+            dist/ios/source-provenance.json
+            dist/ios/verification.json
+            dist/ios/SHA256SUMS

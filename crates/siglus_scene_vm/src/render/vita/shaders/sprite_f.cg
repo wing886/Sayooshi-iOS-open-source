@@ -1,0 +1,185 @@
+// fs_common_2d (render/shaders/sprite.wgsl): every sprite effect.
+//
+// fu[0..10]  sprite_effects (effects1..effects11, see render_plan)
+// fu[11]     tex0 size, tex3 size (source image sizes)
+// fu[12]     target pixel -> logical pixel: (x0, y0, sx, sy)
+// fu[13]     camera eye
+// fu[14]     single light position, kind
+// fu[15]     camera params (logical width, height in zw)
+// fu[16]     scissor in target pixels (x0, y0, x1, y1); off when x1 <= x0
+// fu[17]     1 / target size (xy), tex4 size (zw)
+#include "sprite.cgh"
+
+float4 main(
+    float4 uv_in : TEXCOORD0,
+    float4 world_pos : TEXCOORD1,
+    float4 world_normal : TEXCOORD2,
+    float alpha_in : TEXCOORD3,
+    float4 wpos : WPOS,
+    uniform sampler2D tex0 : TEXUNIT0,
+    uniform sampler2D tex1 : TEXUNIT1,
+    uniform sampler2D tex2 : TEXUNIT2,
+    uniform sampler2D tex3 : TEXUNIT3,
+    uniform sampler2D tex4 : TEXUNIT4,
+    uniform float4 fu[18]) : COLOR
+{
+    float4 scissor = fu[16];
+    if (scissor.z > scissor.x && (wpos.x < scissor.x || wpos.y < scissor.y || wpos.x >= scissor.z || wpos.y >= scissor.w)) {
+        discard;
+    }
+    float4 e1 = fu[0];
+    float4 e2 = fu[1];
+    float4 e3 = fu[2];
+    float4 e4 = fu[3];
+    float4 e5 = fu[4];
+    float4 e6 = fu[5];
+    float4 e7 = fu[6];
+    float4 e8 = fu[7];
+    float4 e9 = fu[8];
+    float4 e10 = fu[9];
+    float4 e11 = fu[10];
+    float2 uv = uv_in.xy;
+    float2 uv_aux = uv_in.zw;
+
+    float tr = e1.x;
+    float mask_mode = e4.x;
+    float alpha_test = e4.y;
+    float light_on = e4.z;
+    float fog_on = e4.w;
+    float has_mask = e5.x;
+    float tonecurve_row = e5.z;
+    float wipe_mode = e6.x;
+    float wipe_p0 = e6.y;
+    float wipe_p1 = e6.z;
+    float wipe_p2 = e6.w;
+    float wipe_p3 = e7.x;
+    float has_wipe_src = e7.y;
+    float blend_code = e7.z;
+    float wipe_aux1 = e7.w;
+    float light_factor = e8.w;
+    float fog_scroll_x = e9.w;
+    float4 fog_color_fallback = float4(e10.xyz, 1.0);
+    float sprite_z = e10.w;
+    float fog_near = e11.x;
+    float fog_far = e11.y;
+    float has_fog_tex = e11.z;
+    float camera_z = e11.w;
+    float alpha_ref = 1.0 / 255.0;
+    float2 tex0_size = fu[11].xy;
+    float2 tex3_size = fu[11].zw;
+
+    float4 c;
+    if (wipe_mode < 0.5) {
+        c = tex2D(tex0, uv);
+    } else if (wipe_mode < 1.5) {
+        c = sample_mosaic(tex0, uv, wipe_p0, wipe_p1);
+        c.a = 1.0;
+    } else if (wipe_mode < 2.5) {
+        c = sample_raster_h(tex0, uv, wipe_p0, wipe_p1, wipe_p2, wipe_p3);
+    } else if (wipe_mode < 3.5) {
+        c = sample_raster_v(tex0, uv, wipe_p0, wipe_p1, wipe_p2, wipe_p3);
+    } else if (wipe_mode < 4.5) {
+        c = sample_explosion_blur(tex0, tex0_size, uv, float2(wipe_p0, wipe_p1), wipe_p2, wipe_p3);
+        c.a = 1.0;
+    } else if (wipe_mode < 5.5) {
+        c = sample_shimi(tex0, uv, wipe_p0, wipe_p1, false);
+    } else if (wipe_mode < 6.5) {
+        c = sample_shimi(tex0, uv, wipe_p0, wipe_p1, true);
+    } else if (wipe_mode > 9.5 && wipe_mode < 10.5 && has_wipe_src > 0.5) {
+        float4 oldc = sample_mosaic(tex3, uv, wipe_p0, wipe_p1);
+        float4 newc = sample_mosaic(tex0, uv, wipe_p0, wipe_p1);
+        if (wipe_p3 < 230.5) {
+            c = wipe_p2 >= 0.5 ? newc : oldc;
+        } else {
+            c = lerp(wipe_aux1 < 0.5 ? oldc : newc, wipe_aux1 < 0.5 ? newc : oldc, clamp(wipe_p2, 0.0, 1.0));
+        }
+    } else if (wipe_mode > 10.5 && wipe_mode < 11.5 && has_wipe_src > 0.5) {
+        c = lerp(
+            sample_raster_h(tex3, uv, wipe_p0, wipe_p1, wipe_p2, wipe_p3),
+            sample_raster_h(tex0, uv, wipe_p0, wipe_p1, wipe_p2, wipe_p3),
+            clamp(wipe_p3, 0.0, 1.0));
+    } else if (wipe_mode > 11.5 && wipe_mode < 12.5 && has_wipe_src > 0.5) {
+        c = lerp(
+            sample_raster_v(tex3, uv, wipe_p0, wipe_p1, wipe_p2, wipe_p3),
+            sample_raster_v(tex0, uv, wipe_p0, wipe_p1, wipe_p2, wipe_p3),
+            clamp(wipe_p3, 0.0, 1.0));
+    } else if (wipe_mode > 12.5 && wipe_mode < 13.5 && has_wipe_src > 0.5) {
+        c = lerp(
+            sample_explosion_blur(tex3, tex3_size, uv, float2(wipe_p0, wipe_p1), wipe_p2, wipe_p3),
+            sample_explosion_blur(tex0, tex0_size, uv, float2(wipe_p0, wipe_p1), wipe_p2, wipe_p3),
+            clamp(tonecurve_row, 0.0, 1.0));
+        c.a = 1.0;
+    } else {
+        c = tex2D(tex0, uv);
+    }
+
+    float4 color = c * float4(1.0, 1.0, 1.0, alpha_in * tr);
+    float4 color_org = color;
+
+    // Target pixel in the logical screen (the desktop draws at logical size).
+    float2 logical = (wpos.xy - fu[12].xy) * fu[12].zw;
+    bool world_has_pos = world_normal.w > 0.5;
+    if (light_on > 0.5) {
+        if (world_has_pos && length(world_normal.xyz) > 0.25) {
+            float3 normal = normalize(world_normal.xyz);
+            float3 dir_point = fu[14].xyz - world_pos.xyz;
+            float distance_point = length(dir_point);
+            float3 light_dir = dir_point / max(distance_point, 1e-6);
+            float light_power = dot(normal, light_dir);
+            light_power = light_power * (1.0 - distance_point / 2000.0);
+            light_power = clamp(light_power, 0.0, 1.0);
+            color = color * float4(e9.xyz, 1.0) * light_power;
+        } else {
+            color = color * float4(e9.xyz, 1.0) * light_factor;
+        }
+    }
+
+    if (fog_on > 0.5) {
+        float depth = abs(sprite_z - camera_z);
+        if (world_has_pos) {
+            depth = length(fu[13].xyz - world_pos.xyz);
+        }
+        float fog_t = clamp((depth - fog_near) / max(fog_far - fog_near, 1e-5), 0.0, 1.0);
+        if (fog_t > 0.0) {
+            float4 fog_color = fog_color_fallback;
+            if (has_fog_tex > 0.5) {
+                float tw = max(fu[17].z, 1.0);
+                float th = max(fu[17].w, 1.0);
+                float vw = max(fu[15].z, 1.0);
+                float vh = max(fu[15].w, 1.0);
+                float aspect = th / vh;
+                float fog_w = vw / tw * aspect;
+                float fog_h = vh / th;
+                float fog_x = -fog_scroll_x / tw * aspect - 0.5 / vw;
+                float fog_y = 0.5 / vh;
+                float2 proj01 = float2(logical.x / vw, logical.y / vh);
+                float2 fog_base = float2(proj01.x * fog_w + fog_x, proj01.y);
+                float2 fog_uv = fog_base * fog_h + float2(fog_y, fog_y);
+                fog_color = tex2D(tex4, fog_uv);
+            }
+            color = lerp(color, fog_color, fog_t);
+        }
+    }
+
+    color = cfx_color(tex2, color, e1, e2, e3, e5);
+    color = blend_identity_fade(color, blend_code, color_org.a);
+
+    float final_gray = dot(color.rgb, LUMA);
+    if (has_mask > 0.5) {
+        color = color * tex2D(tex1, uv_aux);
+    }
+    if (mask_mode > 0.5 && mask_mode < 1.5) {
+        color.a = final_gray;
+    }
+    if (alpha_test > 0.5 && color.a < alpha_ref) {
+        discard;
+    }
+
+    if (blend_code > 4.5 && blend_code < 5.5) {
+        float2 screen_uv = clamp(wpos.xy * fu[17].xy, 0.0, 1.0);
+        float4 dst = sample_safe(tex3, screen_uv);
+        float3 ov = overlay_rgb(dst.rgb, color.rgb);
+        return float4(lerp(dst.rgb, ov, color.a), 1.0);
+    }
+    return color;
+}

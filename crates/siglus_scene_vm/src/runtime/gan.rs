@@ -1,0 +1,386 @@
+//! GAN animation support (ported from the original the original implementation implementation).
+
+use anyhow::{Context, Result, bail};
+use encoding_rs::SHIFT_JIS;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+#[derive(Debug, Clone, Default)]
+pub struct GanPat {
+    pub pat_no: i32,
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub tr: u8,
+    pub wait: i32,
+    pub keika_time: i32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GanSet {
+    pub pat_list: Vec<GanPat>,
+    pub total_time: i32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GanData {
+    pub g00_file_name: String,
+    pub set_list: Vec<GanSet>,
+}
+
+impl GanData {
+    pub fn load(path: &Path) -> Result<Self> {
+        let buf = crate::resource::read_file_bytes(path)
+            .with_context(|| format!("read gan: {:?}", path))?;
+        if buf.len() < 8 {
+            bail!("gan too short: {:?}", path);
+        }
+        let mut data = GanData::default();
+        data.analize(&buf)?;
+        Ok(data)
+    }
+
+    fn analize(&mut self, buf: &[u8]) -> Result<()> {
+        let mut sp = 0usize;
+        let code = read_i32(buf, &mut sp)?;
+        if code != 10000 {
+            bail!("gan bad version code: {code}");
+        }
+        let version = read_i32(buf, &mut sp)?;
+        if version != 10000 {
+            bail!("gan unsupported version: {version}");
+        }
+
+        loop {
+            let code = read_i32(buf, &mut sp)?;
+            if code == 10100 {
+                let len = read_i32(buf, &mut sp)? as usize;
+                let s = read_bytes(buf, &mut sp, len)?;
+                self.g00_file_name = decode_sjis(s);
+                continue;
+            }
+            if code == 20000 {
+                let set_cnt = read_i32(buf, &mut sp)?;
+                if set_cnt > 0 {
+                    for _ in 0..set_cnt {
+                        let mut set = GanSet::default();
+                        let mut keika_time = 0i32;
+                        analize_set(buf, &mut sp, &mut set, &mut keika_time)?;
+                        self.set_list.push(set);
+                    }
+                }
+                return Ok(());
+            }
+
+            bail!("gan unexpected code: {code}");
+        }
+    }
+}
+
+fn analize_set(buf: &[u8], sp: &mut usize, set: &mut GanSet, keika_time: &mut i32) -> Result<()> {
+    let code = read_i32(buf, sp)?;
+    if code != 30000 {
+        bail!("gan set missing PAT_COUNT: {code}");
+    }
+    let pat_cnt = read_i32(buf, sp)?;
+    for _ in 0..pat_cnt {
+        let pat = analize_pat(buf, sp, keika_time)?;
+        set.pat_list.push(pat);
+    }
+    set.total_time = *keika_time;
+    Ok(())
+}
+
+fn analize_pat(buf: &[u8], sp: &mut usize, keika_time: &mut i32) -> Result<GanPat> {
+    let mut pat = GanPat {
+        tr: 255,
+        ..Default::default()
+    };
+    loop {
+        let code = read_i32(buf, sp)?;
+        if code == 999999 {
+            break;
+        }
+        match code {
+            30100 => pat.pat_no = read_i32(buf, sp)?,
+            30101 => pat.x = read_i32(buf, sp)?,
+            30102 => pat.y = read_i32(buf, sp)?,
+            30103 => pat.wait = read_i32(buf, sp)?,
+            30104 => {
+                let v = read_i32(buf, sp)?;
+                pat.tr = v.clamp(0, 255) as u8;
+            }
+            30105 => pat.z = read_i32(buf, sp)?,
+            _ => bail!("gan unexpected pat code: {code}"),
+        }
+    }
+    *keika_time += pat.wait;
+    pat.keika_time = *keika_time;
+    Ok(pat)
+}
+
+fn decode_sjis(bytes: &[u8]) -> String {
+    let (cow, _, had_err) = SHIFT_JIS.decode(bytes);
+    if had_err {
+        String::from_utf8_lossy(bytes).into_owned()
+    } else {
+        cow.into_owned()
+    }
+}
+
+fn read_i32(buf: &[u8], sp: &mut usize) -> Result<i32> {
+    let bytes = read_bytes(buf, sp, 4)?;
+    Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_bytes<'a>(buf: &'a [u8], sp: &mut usize, len: usize) -> Result<&'a [u8]> {
+    if *sp + len > buf.len() {
+        bail!("gan out of range");
+    }
+    let out = &buf[*sp..*sp + len];
+    *sp += len;
+    Ok(out)
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct GanState {
+    data: Option<Arc<GanData>>,
+    current_pat: Option<GanPat>,
+
+    gan_name: String,
+    now_time: i32,
+    anm_set_no: i32,
+    next_anm_set_no: i32,
+
+    anm_start: bool,
+    anm_pause: bool,
+    anm_loop_flag: bool,
+    anm_real_time_flag: bool,
+    next_anm_flag: bool,
+    next_anm_loop_flag: bool,
+    next_anm_real_time_flag: bool,
+}
+
+impl GanState {
+    pub(crate) fn read_short_work(
+        &mut self,
+        reader: &mut crate::original_save::OriginalStreamReader<'_>,
+    ) -> Result<()> {
+        self.now_time = reader.i32()?;
+        self.anm_start = reader.bool()?;
+        self.anm_pause = reader.bool()?;
+        self.anm_set_no = reader.i32()?;
+        self.anm_loop_flag = reader.bool()?;
+        self.anm_real_time_flag = reader.bool()?;
+        Ok(())
+    }
+
+    pub(crate) fn read_original_work(
+        &mut self,
+        reader: &mut crate::original_save::OriginalStreamReader<'_>,
+    ) -> Result<()> {
+        self.now_time = reader.i32()?;
+        self.anm_set_no = reader.i32()?;
+        self.next_anm_set_no = reader.i32()?;
+        self.anm_start = reader.bool()?;
+        self.anm_pause = reader.bool()?;
+        self.anm_loop_flag = reader.bool()?;
+        self.anm_real_time_flag = reader.bool()?;
+        self.next_anm_flag = reader.bool()?;
+        self.next_anm_loop_flag = reader.bool()?;
+        self.next_anm_real_time_flag = reader.bool()?;
+        Ok(())
+    }
+
+    pub fn reset(&mut self) {
+        *self = GanState::default();
+    }
+
+    pub fn current_pat(&self) -> Option<&GanPat> {
+        self.current_pat.as_ref()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.data.is_some() && self.anm_start && !self.anm_pause
+    }
+
+    pub fn load_gan(&mut self, project_dir: &Path, append_dir: &str, name: &str) -> Result<()> {
+        self.reset();
+        self.load_gan_only(project_dir, append_dir, name)
+    }
+
+    pub fn load_gan_only(
+        &mut self,
+        project_dir: &Path,
+        append_dir: &str,
+        name: &str,
+    ) -> Result<()> {
+        if name.trim().is_empty() {
+            return Ok(());
+        }
+        self.gan_name = name.to_string();
+        let path = resolve_gan_path(project_dir, append_dir, name)
+            .with_context(|| format!("resolve gan path: {name}"))?;
+        self.data = Some(load_cached_gan_data(&path)?);
+        Ok(())
+    }
+
+    pub fn start_anm(&mut self, set_no: i32, loop_flag: bool, real_time_flag: bool) {
+        self.now_time = 0;
+        self.anm_start = true;
+        self.anm_pause = false;
+        self.anm_set_no = set_no;
+        self.anm_loop_flag = loop_flag;
+        self.anm_real_time_flag = real_time_flag;
+        self.next_anm_flag = false;
+    }
+
+    pub fn next_anm(&mut self, set_no: i32, loop_flag: bool, real_time_flag: bool) {
+        if self.anm_start {
+            if self.next_anm_flag {
+                self.start_anm(self.next_anm_set_no, false, self.next_anm_real_time_flag);
+            } else {
+                self.anm_loop_flag = false;
+            }
+            self.next_anm_flag = true;
+            self.next_anm_set_no = set_no;
+            self.next_anm_loop_flag = loop_flag;
+            self.next_anm_real_time_flag = real_time_flag;
+        } else {
+            self.start_anm(set_no, loop_flag, real_time_flag);
+        }
+    }
+
+    pub fn pause_anm(&mut self) {
+        self.anm_pause = true;
+    }
+
+    pub fn resume_anm(&mut self) {
+        self.anm_pause = false;
+    }
+
+    pub fn update_time(&mut self, past_game_time: i32, past_real_time: i32) {
+        let mut game = past_game_time.max(0);
+        let mut real = past_real_time.max(0);
+
+        let Some(data) = self.data.as_ref() else {
+            self.current_pat = None;
+            return;
+        };
+        if self.anm_set_no < 0 || self.anm_set_no as usize >= data.set_list.len() {
+            self.current_pat = None;
+            return;
+        }
+        let set = &data.set_list[self.anm_set_no as usize];
+        if set.pat_list.is_empty() {
+            self.current_pat = None;
+            return;
+        }
+        let total_time = set.total_time;
+        let first_pat = set.pat_list[0].clone();
+        let last_pat = set.pat_list[set.pat_list.len() - 1].clone();
+        if !self.anm_start || total_time <= 0 {
+            self.current_pat = Some(first_pat);
+            return;
+        }
+
+        if !self.anm_pause {
+            if self.anm_real_time_flag {
+                self.now_time += real;
+            } else {
+                self.now_time += game;
+            }
+        }
+
+        if !self.anm_loop_flag && self.now_time >= total_time {
+            if self.next_anm_flag {
+                self.start_anm(
+                    self.next_anm_set_no,
+                    self.next_anm_loop_flag,
+                    self.next_anm_real_time_flag,
+                );
+                let overshoot = self.now_time - total_time;
+                game -= overshoot;
+                real -= overshoot;
+                self.update_time(game, real);
+            } else {
+                self.now_time = total_time;
+                self.current_pat = Some(last_pat);
+            }
+            return;
+        }
+
+        if set.total_time > 0 {
+            self.now_time %= set.total_time;
+        }
+
+        for pat in &set.pat_list {
+            if pat.keika_time >= self.now_time {
+                self.current_pat = Some(pat.clone());
+                break;
+            }
+        }
+    }
+}
+
+fn load_cached_gan_data(path: &Path) -> Result<Arc<GanData>> {
+    // Original Siglus/Tona3 routes C_tnm_gan::load_gan_only() through the
+    // process-global G_gan_manager.  Objects that reference the same GAN file
+    // therefore share one parsed C_gan_data instead of re-reading and parsing
+    // the file for every child object.
+    //
+    // Keep weak entries here: active GanState instances own the strong Arc,
+    // while an unused GAN can disappear naturally. This is equivalent to the
+    // original manager's periodic organize() dropping entries whose data is no
+    // longer referenced by any C_tnm_gan.
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Weak<GanData>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Some(data) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(path)
+        .and_then(Weak::upgrade)
+    {
+        return Ok(data);
+    }
+
+    let data = Arc::new(GanData::load(path)?);
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf(), Arc::downgrade(&data));
+    Ok(data)
+}
+
+fn resolve_gan_path(project_dir: &Path, append_dir: &str, name: &str) -> Result<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut norm = name.replace('\\', "/");
+    if !norm.ends_with(".gan") && !norm.contains('.') {
+        norm.push_str(".gan");
+    }
+
+    let path = PathBuf::from(&norm);
+    if path.is_absolute()
+        && let Some(path) = crate::resource::resolve_game_file(&path)?
+    {
+        return Ok(path);
+    }
+
+    if !append_dir.is_empty() {
+        candidates.push(project_dir.join(append_dir).join("gan").join(&norm));
+        candidates.push(project_dir.join(append_dir).join(&norm));
+    }
+    candidates.push(project_dir.join("gan").join(&norm));
+    candidates.push(project_dir.join(&norm));
+    candidates.push(project_dir.join("dat").join(&norm));
+
+    for cand in candidates {
+        if let Some(path) = crate::resource::resolve_game_file(&cand)? {
+            return Ok(path);
+        }
+    }
+
+    bail!("gan file not found: {name}")
+}

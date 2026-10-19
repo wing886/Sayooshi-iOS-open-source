@@ -1,0 +1,14 @@
+[package]
+name = "siglus_vita_shaderc"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+build = "build.rs"
+publish = false
+
+[workspace]
+
+[package.metadata.vita]
+title_id = "SIGSHADR1"
+title_name = "Siglus Shader Compiler"
+build_std = "std,panic_abort"

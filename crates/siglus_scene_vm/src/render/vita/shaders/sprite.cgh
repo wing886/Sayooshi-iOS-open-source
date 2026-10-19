@@ -1,0 +1,129 @@
+// Helpers of the wgpu sprite shader (render/shaders/sprite.wgsl), ported to Cg
+// one to one. Keep both in step: the Vita must draw what the desktop does.
+
+#define LUMA float3(0.2989, 0.5886, 0.1145)
+
+float4 sample_safe(sampler2D t, float2 uv)
+{
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    return tex2D(t, uv);
+}
+
+float4 sample_mosaic(sampler2D t, float2 uv, float cut_u, float tex_rate_for_square)
+{
+    float cu = max(cut_u, 1e-5);
+    float cv = max(cut_u * max(tex_rate_for_square, 1e-5), 1e-5);
+    float2 tc = float2(floor(uv.x / cu) * cu, floor(uv.y / cv) * cv);
+    return sample_safe(t, tc);
+}
+
+float raster_amp(float progress)
+{
+    float rp = clamp(1.0 - progress, 1e-4, 1.0);
+    float lv = max((1.0 - rp) * 100.0, 1e-4);
+    return 1.0 - ((log(lv) / log(10.0)) + 1.0) / 3.0;
+}
+
+float raster_shift(float axis, float fraction_num, float wave_num, float power, float progress)
+{
+    float fnn = max(fraction_num, 1.0);
+    float t = frac(axis * fnn);
+    t = (t - fnn * 0.1) / fnn;
+    return sin(3.14159265 * progress * power + t * 3.14159265 * wave_num) * raster_amp(progress);
+}
+
+float4 sample_raster_h(sampler2D t, float2 uv, float fraction_num, float wave_num, float power, float progress)
+{
+    float dx = raster_shift(uv.y, fraction_num, wave_num, power, progress);
+    return sample_safe(t, float2(uv.x + dx, uv.y));
+}
+
+float4 sample_raster_v(sampler2D t, float2 uv, float fraction_num, float wave_num, float power, float progress)
+{
+    float dy = raster_shift(uv.x, fraction_num, wave_num, power, progress);
+    return sample_safe(t, float2(uv.x, uv.y + dy));
+}
+
+// `dims`: the texture's size as the desktop renderer sees it (the source
+// image), whatever size the Vita uploaded.
+float4 sample_explosion_blur(sampler2D t, float2 dims, float2 uv, float2 center_uv, float blur_power, float blur_coeff)
+{
+    float texel = 1.0 / max(max(dims.x, dims.y), 1.0);
+    float2 dir = center_uv - uv;
+    float len = length(dir);
+    if (len <= 1e-5 || blur_power <= 1e-5) {
+        return sample_safe(t, uv);
+    }
+    dir = normalize(dir) * texel * blur_power * len * max(blur_coeff, 0.0);
+    return sample_safe(t, uv) * 0.19
+        + sample_safe(t, uv + dir * 1.0) * 0.17
+        + sample_safe(t, uv + dir * 2.0) * 0.15
+        + sample_safe(t, uv + dir * 3.0) * 0.13
+        + sample_safe(t, uv + dir * 4.0) * 0.11
+        + sample_safe(t, uv + dir * 5.0) * 0.09
+        + sample_safe(t, uv + dir * 6.0) * 0.07
+        + sample_safe(t, uv + dir * 7.0) * 0.05
+        + sample_safe(t, uv + dir * 8.0) * 0.03
+        + sample_safe(t, uv + dir * 9.0) * 0.01;
+}
+
+float4 sample_shimi(sampler2D t, float2 uv, float fade_multiplier, float threshold, bool inverse)
+{
+    float4 color = sample_safe(t, uv);
+    float brightness = dot(color.rgb, LUMA);
+    if (inverse ? brightness >= threshold : brightness <= threshold) {
+        color.a = color.a * fade_multiplier;
+    }
+    return color;
+}
+
+float overlay_channel(float dst, float src)
+{
+    return dst <= 0.5 ? 2.0 * dst * src : 1.0 - 2.0 * (1.0 - dst) * (1.0 - src);
+}
+
+float3 overlay_rgb(float3 dst, float3 src)
+{
+    return float3(overlay_channel(dst.r, src.r), overlay_channel(dst.g, src.g), overlay_channel(dst.b, src.b));
+}
+
+float3 apply_tonecurve_from_mono(sampler2D tone, float3 color_in, float mono_y, float curve_row, float sat)
+{
+    float3 color = lerp(color_in, float3(mono_y, mono_y, mono_y), sat);
+    float r = tex2D(tone, float2(color.r, curve_row)).r;
+    float g = tex2D(tone, float2(color.g, curve_row)).g;
+    float b = tex2D(tone, float2(color.b, curve_row)).b;
+    return float3(r, g, b);
+}
+
+// The CFX colour sequence shared by sprites and meshes: tone curve,
+// reverse, mono, bright, dark, colour rate and add.
+float4 cfx_color(sampler2D tone, float4 color, float4 e1, float4 e2, float4 e3, float4 e5)
+{
+    float mono_y = dot(color.rgb, LUMA);
+    if (e5.y > 0.5) {
+        color.rgb = apply_tonecurve_from_mono(tone, color.rgb, mono_y, e5.z, e5.w);
+    }
+    color.rgb = lerp(color.rgb, float3(1.0, 1.0, 1.0) - color.rgb, e1.z);
+    color.rgb = lerp(color.rgb, float3(mono_y, mono_y, mono_y), e1.y);
+    color.rgb = color.rgb + float3(e1.w, e1.w, e1.w);
+    color.rgb = color.rgb - float3(e2.x, e2.x, e2.x);
+    color.rgb = lerp(color.rgb, e3.yzw, e2.y);
+    color.rgb = color.rgb + float3(e2.z, e2.w, e3.x);
+    return color;
+}
+
+// Blend codes 3 (multiply) and 4 (screen) fade towards the blend's
+// identity by the source alpha.
+float4 blend_identity_fade(float4 color, float blend_code, float alpha)
+{
+    if (blend_code > 2.5 && blend_code < 3.5) {
+        color = lerp(float4(1.0, 1.0, 1.0, 1.0), color, alpha);
+    } else if (blend_code > 3.5 && blend_code < 4.5) {
+        color = lerp(float4(0.0, 0.0, 0.0, 0.0), color, alpha);
+    }
+    color.a = alpha;
+    return color;
+}

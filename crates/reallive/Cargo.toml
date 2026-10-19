@@ -1,0 +1,40 @@
+[package]
+name = "reallive"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+game_fs = { path = "../game_fs" }
+web-time = "1.1"
+anyhow.workspace = true
+chrono.workspace = true
+encoding_rs = "0.8"
+ab_glyph = "0.2"
+siglus_assets = { path = "../siglus_assets" }
+avg32 = { path = "../avg32" }
+na_mpeg2_decoder = { path = "../na_mpeg2_decoder" }
+image.workspace = true
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+chrono = { workspace = true, features = ["wasmbind"] }
+cpal = { version = "0.15", features = ["wasm-bindgen"] }
+
+[features]
+desktop-player = ["dep:bytemuck", "dep:clap", "dep:pollster", "dep:wgpu", "dep:winit"]
+
+[target.'cfg(not(target_os = "horizon"))'.dependencies]
+kira.workspace = true
+bytemuck = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
+winit = { workspace = true, optional = true }
+
+[[bin]]
+name = "reallive_player"
+path = "src/bin/reallive_player.rs"
+required-features = ["desktop-player"]
+
+[lints]
+workspace = true

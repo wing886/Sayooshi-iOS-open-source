@@ -1,0 +1,26 @@
+// A sprite with no effect (all of fs_common_2d's steps are identities):
+// the texture at the draw's alpha, or the copy between render targets.
+//
+// fu[0]  x: tr, y: blend code (3 multiply / 4 screen fade to identity)
+// fu[1]  scissor in target pixels (x0, y0, x1, y1); off when x1 <= x0
+float4 main(
+    float4 uv_in : TEXCOORD0,
+    float alpha_in : TEXCOORD3,
+    float4 wpos : WPOS,
+    uniform sampler2D tex0 : TEXUNIT0,
+    uniform float4 fu[2]) : COLOR
+{
+    float4 scissor = fu[1];
+    if (scissor.z > scissor.x && (wpos.x < scissor.x || wpos.y < scissor.y || wpos.x >= scissor.z || wpos.y >= scissor.w)) {
+        discard;
+    }
+    float4 color = tex2D(tex0, uv_in.xy);
+    float alpha = color.a * alpha_in * fu[0].x;
+    if (fu[0].y > 2.5 && fu[0].y < 3.5) {
+        color = lerp(float4(1.0, 1.0, 1.0, 1.0), color, alpha);
+    } else if (fu[0].y > 3.5 && fu[0].y < 4.5) {
+        color = lerp(float4(0.0, 0.0, 0.0, 0.0), color, alpha);
+    }
+    color.a = alpha;
+    return color;
+}

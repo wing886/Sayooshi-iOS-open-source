@@ -1,0 +1,10 @@
+[package]
+name = "siglus_cfx_decompiler"
+version = "0.1.0"
+edition.workspace = true
+license = "MPL-2.0"
+
+[dependencies]
+
+[lints]
+workspace = true

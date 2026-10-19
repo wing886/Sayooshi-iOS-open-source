@@ -1,0 +1,13 @@
+[package]
+name = "game_fs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Game file access: std::fs on native targets, the launcher's file index on the web"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+
+[lints]
+workspace = true

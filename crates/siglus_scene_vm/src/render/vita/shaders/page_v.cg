@@ -1,0 +1,7 @@
+// A page-wipe vertex (render/shaders/page_wipe.wgsl): clip position
+// from the CPU.
+void main(float4 clip_position, float2 uv, out float4 out_pos : POSITION, out float2 out_uv : TEXCOORD0)
+{
+    out_pos = clip_position;
+    out_uv = uv;
+}

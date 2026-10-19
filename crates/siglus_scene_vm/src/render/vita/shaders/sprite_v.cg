@@ -1,0 +1,23 @@
+// vs_sprite_2d (render/shaders/sprite.wgsl): a CPU-projected sprite vertex.
+// For 3D quads the original clip W is restored, so UVs and world
+// positions interpolate perspective-correctly.
+void main(
+    float3 pos,
+    float2 uv,
+    float2 uv_aux,
+    float alpha,
+    float4 world_pos,
+    float4 world_normal,
+    out float4 out_pos : POSITION,
+    out float4 out_uv : TEXCOORD0,
+    out float4 out_world_pos : TEXCOORD1,
+    out float4 out_world_normal : TEXCOORD2,
+    out float out_alpha : TEXCOORD3)
+{
+    float clip_w = world_normal.w > 0.5 ? max(world_pos.w, 1e-6) : 1.0;
+    out_pos = float4(pos * clip_w, clip_w);
+    out_uv = float4(uv, uv_aux);
+    out_world_pos = world_pos;
+    out_world_normal = world_normal;
+    out_alpha = alpha;
+}

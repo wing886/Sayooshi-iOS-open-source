@@ -1,0 +1,3 @@
+// vs_shadow_static / vs_shadow_skinned.
+#define SHADOW
+#include "mesh_vertex.cgh"

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Siglus</string>
+    <string name="import_game">Import</string>
+    <string name="refresh">Refresh</string>
+    <string name="library_title">Games</string>
+    <string name="engines_line">SiglusEngine · RealLive · AVG32 · UK2</string>
+    <string name="empty_title">No games yet</string>
+    <string name="empty_message">Tap Import and choose a game folder, or a folder that contains several games. SiglusEngine, RealLive, AVG32 and UK2 games are detected automatically.</string>
+    <string name="scanning">Scanning folders…</string>
+</resources>

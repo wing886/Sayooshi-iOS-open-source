@@ -1,0 +1,421 @@
+package com.chino.siglus;
+
+import android.os.Bundle;
+import android.os.SystemClock;
+import android.util.DisplayMetrics;
+import android.view.Choreographer;
+import android.view.MotionEvent;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
+import android.view.View;
+import android.widget.Toast;
+import android.app.AlertDialog;
+import java.lang.ref.WeakReference;
+import java.util.concurrent.ConcurrentHashMap;
+
+import androidx.activity.OnBackPressedCallback;
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowCompat;
+import androidx.core.view.WindowInsetsCompat;
+import androidx.core.view.WindowInsetsControllerCompat;
+
+import org.json.JSONObject;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
+
+/**
+ * Android player activity using the same host-driven model as iOS:
+ * - Java owns the main loop (Choreographer)
+ * - Java owns the Surface lifecycle (SurfaceView)
+ * - Rust is stepped via siglus_android_* exported symbols
+ */
+public final class SiglusGameActivity extends AppCompatActivity
+        implements SurfaceHolder.Callback, Choreographer.FrameCallback, View.OnTouchListener {
+
+    private static final ConcurrentHashMap<Long, WeakReference<SiglusGameActivity>> sActivitiesByHandle = new ConcurrentHashMap<>();
+
+    public static void onNativeMessagebox(long engineHandle, long requestId, int kind, String title, String message) {
+        WeakReference<SiglusGameActivity> ref = sActivitiesByHandle.get(engineHandle);
+        SiglusGameActivity activity = ref != null ? ref.get() : null;
+        if (activity == null) {
+            NativeSiglus.submitMessageboxResult(engineHandle, requestId, fallbackMessageboxValue(kind));
+            return;
+        }
+        activity.runOnUiThread(() -> activity.showNativeMessagebox(engineHandle, requestId, kind, title, message));
+    }
+
+    private static long fallbackMessageboxValue(int kind) {
+        switch (kind) {
+            case 0: return 0; // OK
+            case 1: return 1; // OK/CANCEL -> CANCEL
+            case 2: return 1; // YES/NO -> NO
+            case 3: return 2; // YES/NO/CANCEL -> CANCEL
+            default: return 0;
+        }
+    }
+
+    private SurfaceView surfaceView;
+
+    private long handle = 0;
+    private boolean running = false;
+    /**
+     * True while {@link #surfaceView} has a usable {@link Surface}. Android destroys the
+     * ANativeWindow whenever the activity stops, so the engine outlives the surface: the frame
+     * loop must not run (and must not render into a dead window) until the surface is re-attached.
+     */
+    private volatile boolean surfaceReady = false;
+    private long lastFrameNs = 0;
+
+    /** 0x1B is what the host maps to VmKey::Escape, the engine's own cancel/back key. */
+    private static final int KEY_ESCAPE = 0x1B;
+    /** Two back presses within this window actually leave the game. */
+    private static final long BACK_EXIT_WINDOW_MS = 2000L;
+    private long lastBackMs = 0L;
+
+    private String gameRoot;
+
+    @Override
+    protected void onCreate(@Nullable Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+
+        // Fullscreen immersive.
+        WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
+        setContentView(R.layout.activity_player);
+
+        surfaceView = findViewById(R.id.surface_view);
+        LaunchParams p = readLaunchParams();
+        if (p == null) {
+            Toast.makeText(this, "Missing launch.json", Toast.LENGTH_LONG).show();
+            finish();
+            return;
+        }
+        gameRoot = p.gameRoot;
+
+        surfaceView.getHolder().addCallback(this);
+        surfaceView.setOnTouchListener(this);
+        surfaceView.setFocusable(true);
+        surfaceView.setFocusableInTouchMode(true);
+        surfaceView.requestFocus();
+        surfaceView.setKeepScreenOn(true);
+
+        applyImmersive();
+        installBackKeyHandling();
+    }
+
+    /**
+     * Android's back gesture must not kill the game outright (the Activity has no back handling of
+     * its own, so the platform default finished the Activity and tore the engine down).
+     *
+     * A single back press is forwarded to the engine as Escape, which is genuinely the game's own
+     * cancel key: the scripts use it to close menus, cancel a selection
+     * (`selbtn.cancel_enable` / `sel.cancel_enable`) and to skip. Pressing it twice within
+     * {@link #BACK_EXIT_WINDOW_MS} leaves the game, so the player is never trapped.
+     */
+    private void installBackKeyHandling() {
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                long now = SystemClock.uptimeMillis();
+                if (lastBackMs != 0L && now - lastBackMs <= BACK_EXIT_WINDOW_MS) {
+                    setEnabled(false);
+                    getOnBackPressedDispatcher().onBackPressed();
+                    return;
+                }
+                lastBackMs = now;
+                if (handle != 0) {
+                    NativeSiglus.keyDown(handle, KEY_ESCAPE);
+                    NativeSiglus.keyUp(handle, KEY_ESCAPE);
+                }
+                Toast.makeText(SiglusGameActivity.this, "再按一次返回键退出游戏", Toast.LENGTH_SHORT).show();
+            }
+        });
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        applyImmersive();
+        maybeStartFrameLoop();
+    }
+
+    @Override
+    protected void onPause() {
+        stopFrameLoop();
+        super.onPause();
+    }
+
+    @Override
+    protected void onDestroy() {
+        stopFrameLoop();
+        destroyEngine();
+        super.onDestroy();
+    }
+
+    private void applyImmersive() {
+        final View decor = getWindow().getDecorView();
+        WindowInsetsControllerCompat c = ViewCompat.getWindowInsetsController(decor);
+        if (c != null) {
+            c.hide(WindowInsetsCompat.Type.systemBars());
+            c.setSystemBarsBehavior(WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+        }
+    }
+
+    // ---- Surface lifecycle ----
+
+    @Override
+    public void surfaceCreated(@NonNull SurfaceHolder holder) {
+        if (handle != 0) {
+            // Coming back from the background: Android hands us a new ANativeWindow. Keep the
+            // running engine (the player's progress lives in it) and re-attach the window.
+            int w = holder.getSurfaceFrame() != null ? holder.getSurfaceFrame().width() : surfaceView.getWidth();
+            int h = holder.getSurfaceFrame() != null ? holder.getSurfaceFrame().height() : surfaceView.getHeight();
+            surfaceReady = NativeSiglus.setSurface(
+                    handle, holder.getSurface(), Math.max(1, w), Math.max(1, h));
+            if (!surfaceReady) {
+                Toast.makeText(this, "Failed to re-attach rendering surface", Toast.LENGTH_LONG).show();
+                return;
+            }
+        } else {
+            ensureEngine(holder);
+        }
+        maybeStartFrameLoop();
+    }
+
+    @Override
+    public void surfaceChanged(@NonNull SurfaceHolder holder, int format, int width, int height) {
+        if (handle == 0) {
+            ensureEngine(holder);
+        } else {
+            // SurfaceChanged fires frequently (format/size). Avoid recreating the WGPU surface here;
+            // just resize the existing swapchain. Surface recreation is handled by surfaceCreated/Destroyed.
+            NativeSiglus.resize(handle, width, height);
+        }
+    }
+
+    @Override
+    public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
+        // The ANativeWindow behind this Surface is about to become invalid, but the engine must
+        // survive: backgrounding the app must not restart the game. Only onDestroy() tears the
+        // engine down, so a background/foreground round trip keeps the current scene.
+        surfaceReady = false;
+        stopFrameLoop();
+    }
+
+    private void ensureEngine(@NonNull SurfaceHolder holder) {
+        if (handle != 0) {
+            return;
+        }
+        if (gameRoot == null || gameRoot.isEmpty()) {
+            Toast.makeText(this, "Missing game root", Toast.LENGTH_LONG).show();
+            finish();
+            return;
+        }
+
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        double scale = dm.density;
+
+        // Must initialize ndk-context before the Rust engine initializes audio backends.
+        NativeSiglus.initAndroidContext(getApplicationContext());
+
+        int w = holder.getSurfaceFrame() != null ? holder.getSurfaceFrame().width() : surfaceView.getWidth();
+        int h = holder.getSurfaceFrame() != null ? holder.getSurfaceFrame().height() : surfaceView.getHeight();
+        if (w <= 0 || h <= 0) {
+            w = Math.max(1, surfaceView.getWidth());
+            h = Math.max(1, surfaceView.getHeight());
+        }
+
+        long hnd = NativeSiglus.create(holder.getSurface(), w, h, scale, gameRoot);
+        if (hnd == 0) {
+            Toast.makeText(this, "Failed to create engine", Toast.LENGTH_LONG).show();
+            finish();
+            return;
+        }
+        handle = hnd;
+        surfaceReady = true;
+        sActivitiesByHandle.put(handle, new WeakReference<>(this));
+        NativeSiglus.setNativeMessageboxCallback(handle);
+    }
+
+    private void destroyEngine() {
+        if (handle != 0) {
+            sActivitiesByHandle.remove(handle);
+            NativeSiglus.destroy(handle);
+            handle = 0;
+        }
+    }
+
+    // ---- Frame loop ----
+
+    private void maybeStartFrameLoop() {
+        if (!running && handle != 0 && surfaceReady) {
+            running = true;
+            lastFrameNs = 0;
+            Choreographer.getInstance().postFrameCallback(this);
+        }
+    }
+
+    private void stopFrameLoop() {
+        if (running) {
+            running = false;
+            lastFrameNs = 0;
+            Choreographer.getInstance().removeFrameCallback(this);
+        }
+    }
+
+    @Override
+    public void doFrame(long frameTimeNanos) {
+        if (!running || handle == 0) {
+            return;
+        }
+
+        if (lastFrameNs == 0) {
+            lastFrameNs = frameTimeNanos;
+        }
+        long dtNs = frameTimeNanos - lastFrameNs;
+        lastFrameNs = frameTimeNanos;
+
+        int dtMs = (int) (dtNs / 1_000_000L);
+        if (dtMs < 0) dtMs = 0;
+        if (dtMs > 250) dtMs = 250; // clamp (pause/background)
+
+        int stepStatus = NativeSiglus.step(handle, dtMs);
+        if (stepStatus > 0) {
+            finish();
+            return;
+        }
+        if (stepStatus < 0) {
+            // Native VM errors are not normal game exits. Stop this frame loop so
+            // the same failing instruction is not retried every vsync, but keep
+            // the Activity and last frame alive for logcat/debugging.
+            running = false;
+            return;
+        }
+
+        Choreographer.getInstance().postFrameCallback(this);
+    }
+
+    // ---- Touch ----
+
+    @Override
+    public boolean onTouch(View v, MotionEvent e) {
+        if (handle == 0 || e == null) {
+            return false;
+        }
+
+        int action = e.getActionMasked();
+        int phase;
+        switch (action) {
+            case MotionEvent.ACTION_DOWN:
+                phase = 0;
+                break;
+            case MotionEvent.ACTION_MOVE:
+                phase = 1;
+                break;
+            case MotionEvent.ACTION_UP:
+                phase = 2;
+                break;
+            case MotionEvent.ACTION_CANCEL:
+                phase = 3;
+                break;
+            default:
+                return false;
+        }
+
+        double x = e.getX();
+        double y = e.getY();
+        NativeSiglus.touch(handle, phase, x, y);
+        return true;
+    }
+
+
+    private void showNativeMessagebox(long engineHandle, long requestId, int kind, String title, String message) {
+        if (isFinishing() || isDestroyed()) {
+            NativeSiglus.submitMessageboxResult(engineHandle, requestId, fallbackMessageboxValue(kind));
+            return;
+        }
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle((title == null || title.isEmpty()) ? "Siglus" : title);
+        builder.setMessage(message == null ? "" : message);
+        builder.setCancelable(true);
+
+        switch (kind) {
+            case 0: // OK
+                builder.setPositiveButton("OK", (dialog, which) -> NativeSiglus.submitMessageboxResult(engineHandle, requestId, 0));
+                builder.setOnCancelListener(dialog -> NativeSiglus.submitMessageboxResult(engineHandle, requestId, 0));
+                break;
+            case 1: // OK/CANCEL
+                builder.setPositiveButton("OK", (dialog, which) -> NativeSiglus.submitMessageboxResult(engineHandle, requestId, 0));
+                builder.setNegativeButton("Cancel", (dialog, which) -> NativeSiglus.submitMessageboxResult(engineHandle, requestId, 1));
+                builder.setOnCancelListener(dialog -> NativeSiglus.submitMessageboxResult(engineHandle, requestId, 1));
+                break;
+            case 2: // YES/NO
+                builder.setPositiveButton("Yes", (dialog, which) -> NativeSiglus.submitMessageboxResult(engineHandle, requestId, 0));
+                builder.setNegativeButton("No", (dialog, which) -> NativeSiglus.submitMessageboxResult(engineHandle, requestId, 1));
+                builder.setOnCancelListener(dialog -> NativeSiglus.submitMessageboxResult(engineHandle, requestId, 1));
+                break;
+            case 3: // YES/NO/CANCEL
+                builder.setPositiveButton("Yes", (dialog, which) -> NativeSiglus.submitMessageboxResult(engineHandle, requestId, 0));
+                builder.setNegativeButton("No", (dialog, which) -> NativeSiglus.submitMessageboxResult(engineHandle, requestId, 1));
+                builder.setNeutralButton("Cancel", (dialog, which) -> NativeSiglus.submitMessageboxResult(engineHandle, requestId, 2));
+                builder.setOnCancelListener(dialog -> NativeSiglus.submitMessageboxResult(engineHandle, requestId, 2));
+                break;
+            default:
+                builder.setPositiveButton("OK", (dialog, which) -> NativeSiglus.submitMessageboxResult(engineHandle, requestId, 0));
+                builder.setOnCancelListener(dialog -> NativeSiglus.submitMessageboxResult(engineHandle, requestId, 0));
+                break;
+        }
+
+        AlertDialog dialog = builder.create();
+        dialog.setOnDismissListener(null);
+        dialog.show();
+    }
+
+    // ---- Launch contract ----
+
+    private static final class LaunchParams {
+        final String gameRoot;
+
+        LaunchParams(String gameRoot) {
+            this.gameRoot = gameRoot;
+        }
+    }
+
+    @Nullable
+    private LaunchParams readLaunchParams() {
+        try {
+            File base = new File(getFilesDir(), "SiglusLauncher");
+            File f = new File(base, "launch.json");
+            if (!f.isFile()) {
+                return null;
+            }
+            byte[] data;
+            try (FileInputStream in = new FileInputStream(f);
+                 ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) >= 0) {
+                    if (n > 0) {
+                        out.write(buf, 0, n);
+                    }
+                }
+                data = out.toByteArray();
+            }
+            String s = new String(data, StandardCharsets.UTF_8);
+            JSONObject o = new JSONObject(s);
+            String root = o.optString("game_root_utf8", "");
+            if (root == null || root.isEmpty()) {
+                return null;
+            }
+            return new LaunchParams(root);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+}

@@ -1,0 +1,167 @@
+// vs_common and vs_shadow_common of the wgpu renderer (render/mod.rs
+// `SHADER`); `SHADOW` selects the shadow-map variant.
+#include "mesh.cgh"
+
+uniform float4 vs[120];
+// Bone b's matrix is columns bones[4b .. 4b + 3] (render_plan BoneUniform).
+uniform float4 bones[256] : BUFFER[0];
+
+float3 apply_model(float3 local)
+{
+    return vs[VS_MODEL].xyz * local.x + vs[VS_MODEL + 1].xyz * local.y + vs[VS_MODEL + 2].xyz * local.z + vs[VS_MODEL + 3].xyz;
+}
+
+float3 apply_normal(float3 local)
+{
+    float3 n = vs[VS_NORMAL].xyz * local.x + vs[VS_NORMAL + 1].xyz * local.y + vs[VS_NORMAL + 2].xyz * local.z;
+    if (length(n) <= 1e-6) {
+        return float3(0.0, 0.0, 1.0);
+    }
+    return normalize(n);
+}
+
+float3 apply_frame(float3 local)
+{
+    return vs[VS_FRAME].xyz * local.x + vs[VS_FRAME + 1].xyz * local.y + vs[VS_FRAME + 2].xyz * local.z + vs[VS_FRAME + 3].xyz;
+}
+
+float3 apply_frame_normal(float3 local)
+{
+    float3 n = vs[VS_FRAME_NORMAL].xyz * local.x + vs[VS_FRAME_NORMAL + 1].xyz * local.y + vs[VS_FRAME_NORMAL + 2].xyz * local.z;
+    if (length(n) <= 1e-6) {
+        return float3(0.0, 0.0, 1.0);
+    }
+    return normalize(n);
+}
+
+float3 bone_point(float index, float3 local)
+{
+    int b = (int)min(max(index, 0.0), 63.0) * 4;
+    return bones[b].xyz * local.x + bones[b + 1].xyz * local.y + bones[b + 2].xyz * local.z + bones[b + 3].xyz;
+}
+
+float3 bone_vector(float index, float3 local)
+{
+    int b = (int)min(max(index, 0.0), 63.0) * 4;
+    return bones[b].xyz * local.x + bones[b + 1].xyz * local.y + bones[b + 2].xyz * local.z;
+}
+
+float3 skin_local(float3 local, float4 bi, float4 bw)
+{
+    float sum_w = bw.x + bw.y + bw.z + bw.w;
+    if (vs[VS_FLAGS].w <= 0.5 || sum_w <= 1e-6) {
+        return apply_frame(local);
+    }
+    float3 o = float3(0.0, 0.0, 0.0);
+    if (bw.x > 0.0) { o += bone_point(bi.x, local) * bw.x; }
+    if (bw.y > 0.0) { o += bone_point(bi.y, local) * bw.y; }
+    if (bw.z > 0.0) { o += bone_point(bi.z, local) * bw.z; }
+    if (bw.w > 0.0) { o += bone_point(bi.w, local) * bw.w; }
+    return o;
+}
+
+float3 skin_normal(float3 local, float4 bi, float4 bw)
+{
+    float sum_w = bw.x + bw.y + bw.z + bw.w;
+    if (vs[VS_FLAGS].w <= 0.5 || sum_w <= 1e-6) {
+        return apply_frame_normal(local);
+    }
+    float3 o = float3(0.0, 0.0, 0.0);
+    if (bw.x > 0.0) { o += bone_vector(bi.x, local) * bw.x; }
+    if (bw.y > 0.0) { o += bone_vector(bi.y, local) * bw.y; }
+    if (bw.z > 0.0) { o += bone_vector(bi.z, local) * bw.z; }
+    if (bw.w > 0.0) { o += bone_vector(bi.w, local) * bw.w; }
+    if (length(o) <= 1e-6) {
+        return float3(0.0, 0.0, 1.0);
+    }
+    return normalize(o);
+}
+
+float4 project_main(float3 world)
+{
+    if (vs[VS_FLAGS].y > 0.5) {
+        float3 rel = world - vs[VS_CAMERA_EYE].xyz;
+        float cx = dot(rel, vs[VS_CAMERA_RIGHT].xyz);
+        float cy = dot(rel, vs[VS_CAMERA_UP].xyz);
+        float cz = dot(rel, vs[VS_CAMERA_FORWARD].xyz);
+        float near_z = 1.0;
+        float far_z = 10000.0;
+        float x_clip = cx / max(vs[VS_CAMERA_PARAMS].x, 1e-3);
+        float y_clip = cy / max(vs[VS_CAMERA_PARAMS].y, 1e-3);
+        float z_clip = far_z / (far_z - near_z) * cz - near_z * far_z / (far_z - near_z);
+        return float4(x_clip, y_clip, z_clip, cz);
+    }
+    float x_ndc = (world.x / max(vs[VS_CAMERA_PARAMS].z, 1.0)) * 2.0 - 1.0;
+    float y_ndc = 1.0 - (world.y / max(vs[VS_CAMERA_PARAMS].w, 1.0)) * 2.0;
+    float z_ndc = clamp(-world.z / 50000.0, 0.0, 1.0);
+    return float4(x_ndc, y_ndc, z_ndc, 1.0);
+}
+
+float4 project_shadow(float3 world)
+{
+    if (vs[VS_SHADOW_PARAMS].z <= 0.5) {
+        return float4(0.0, 0.0, 1.0, 1.0);
+    }
+    float3 rel = world - vs[VS_SHADOW_EYE].xyz;
+    float cx = dot(rel, vs[VS_SHADOW_RIGHT].xyz);
+    float cy = dot(rel, vs[VS_SHADOW_UP].xyz);
+    float cz = dot(rel, vs[VS_SHADOW_FORWARD].xyz);
+    if (cz <= 1e-3) {
+        return float4(0.0, 0.0, 1.0, 1.0);
+    }
+    float x_ndc = cx / (cz * max(vs[VS_SHADOW_PARAMS].x, 1e-3));
+    float y_ndc = cy / (cz * max(vs[VS_SHADOW_PARAMS].x, 1e-3));
+    float depth = clamp(cz / max(vs[VS_SHADOW_PARAMS].y, 1.0), 0.0, 1.0);
+    return float4(x_ndc, y_ndc, depth, 1.0);
+}
+
+void main(
+    float3 pos,
+    float2 uv,
+    float alpha,
+    float4 vertex_color_rgb,
+    float4 vertex_color_alpha,
+    float4 world_normal,
+    float4 world_tangent,
+    float4 world_binormal,
+    float4 bone_indices,
+    float4 bone_weights,
+    out float4 out_pos : POSITION,
+    out float4 out_uv : TEXCOORD0,
+    out float4 out_vertex_color : TEXCOORD1,
+    out float4 out_world_pos : TEXCOORD2,
+    out float4 out_world_normal : TEXCOORD3,
+    out float4 out_world_tangent : TEXCOORD4,
+    out float4 out_world_binormal : TEXCOORD5,
+    out float4 out_shadow_pos : TEXCOORD6,
+    out float4 out_proj_pos : TEXCOORD7)
+{
+    float3 local_world = skin_local(pos, bone_indices, bone_weights);
+    float3 world = apply_model(local_world);
+#ifdef SHADOW
+    float4 shadow = project_shadow(world);
+    out_pos = float4(shadow.xyz, 1.0);
+    float depth = clamp(shadow.z / max(abs(shadow.w), 1e-6), 0.0, 1.0);
+    out_uv = float4(uv, depth, vs[VS_EFFECTS + 3].y);
+    out_vertex_color = float4(0.0, 0.0, 0.0, 0.0);
+    out_world_pos = float4(0.0, 0.0, 0.0, 0.0);
+    out_world_normal = float4(0.0, 0.0, 0.0, 0.0);
+    out_world_tangent = float4(0.0, 0.0, 0.0, 0.0);
+    out_world_binormal = float4(0.0, 0.0, 0.0, 0.0);
+    out_shadow_pos = float4(0.0, 0.0, 0.0, 0.0);
+    out_proj_pos = float4(0.0, 0.0, 0.0, 0.0);
+#else
+    float3 local_normal = skin_normal(world_normal.xyz, bone_indices, bone_weights);
+    float3 local_tangent = skin_normal(world_tangent.xyz, bone_indices, bone_weights);
+    float3 local_binormal = skin_normal(world_binormal.xyz, bone_indices, bone_weights);
+    out_pos = project_main(world);
+    out_proj_pos = out_pos;
+    out_uv = float4(uv, alpha, 0.0);
+    out_vertex_color = float4(vertex_color_rgb.xyz, vertex_color_alpha.x);
+    out_world_pos = float4(world, 1.0);
+    out_world_normal = float4(apply_normal(local_normal), 1.0);
+    out_world_tangent = float4(apply_normal(local_tangent), 0.0);
+    out_world_binormal = float4(apply_normal(local_binormal), 0.0);
+    out_shadow_pos = project_shadow(world);
+#endif
+}

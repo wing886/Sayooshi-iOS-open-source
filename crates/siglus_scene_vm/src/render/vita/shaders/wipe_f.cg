@@ -1,0 +1,399 @@
+// The wipe compositor (render/shaders/wipe.wgsl), ported one to one.
+//
+// wu[0]      wipe type, progress, logical width, height
+// wu[1..4]   the wipe's sixteen options (15: random seed)
+// Texture sizes are the logical screen's, as on the desktop (whose render
+// targets have the logical size).
+
+uniform float4 wu[5];
+
+float opt(int i)
+{
+    float4 v = wu[1 + i / 4];
+    int k = i - (i / 4) * 4;
+    return k == 0 ? v.x : (k == 1 ? v.y : (k == 2 ? v.z : v.w));
+}
+
+bool inside(float2 uv)
+{
+    return uv.x >= 0.0 && uv.y >= 0.0 && uv.x <= 1.0 && uv.y <= 1.0;
+}
+
+float4 sample_or_zero(sampler2D t, float2 uv)
+{
+    if (!inside(uv)) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    return tex2D(t, clamp(uv, 0.0, 1.0));
+}
+
+float4 alpha_over(float4 dst, float4 src)
+{
+    float out_a = src.a + dst.a * (1.0 - src.a);
+    if (out_a <= 0.000001) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    float3 rgb = (src.rgb * src.a + dst.rgb * dst.a * (1.0 - src.a)) / out_a;
+    return float4(rgb, out_a);
+}
+
+float mask_fade(int mode)
+{
+    if (mode <= 0) return 0.0;
+    if (mode == 1) return 0.5;
+    if (mode == 2) return 0.75;
+    if (mode == 3) return 0.875;
+    if (mode == 4) return 0.9375;
+    if (mode == 5) return 0.96875;
+    if (mode == 6) return 0.984375;
+    if (mode == 7) return 0.9921875;
+    return 1.0;
+}
+
+float mask_reveal(float progress, float threshold, float fade)
+{
+    if (fade <= 0.000001) {
+        return progress >= threshold ? 1.0 : 0.0;
+    }
+    return clamp((progress - threshold * (1.0 - fade)) / fade, 0.0, 1.0);
+}
+
+float luminance(float4 c)
+{
+    return dot(c.rgb, float3(0.299, 0.587, 0.114)) * c.a;
+}
+
+float4 rect_sample(sampler2D t, float2 uv, float4 rect, float alpha)
+{
+    float2 local = (uv - rect.xy) / max(rect.zw, float2(0.000001, 0.000001));
+    float4 c = sample_or_zero(t, local);
+    return float4(c.rgb, c.a * alpha);
+}
+
+float4 move_rect(int direction, int mode, float progress, bool incoming)
+{
+    if (mode == 0) {
+        return float4(0.0, 0.0, 1.0, 1.0);
+    }
+    if (mode == 1) {
+        float2 start = float2(0.0, 0.0);
+        float2 end = float2(0.0, 0.0);
+        if (incoming) {
+            if (direction == 0) { start.y = -1.0; }
+            else if (direction == 1) { start.y = 1.0; }
+            else if (direction == 2) { start.x = -1.0; }
+            else { start.x = 1.0; }
+        } else {
+            if (direction == 0) { end.y = 1.0; }
+            else if (direction == 1) { end.y = -1.0; }
+            else if (direction == 2) { end.x = 1.0; }
+            else { end.x = -1.0; }
+        }
+        return float4(lerp(start, end, progress), 1.0, 1.0);
+    }
+    float scale = max(incoming ? progress : 1.0 - progress, 0.000001);
+    float4 rect = float4(0.0, 0.0, 1.0, 1.0);
+    if (direction <= 1) {
+        rect.w = scale;
+        if (direction == 1) { rect.y = 1.0 - scale; }
+    } else {
+        rect.z = scale;
+        if (direction == 3) { rect.x = 1.0 - scale; }
+    }
+    return rect;
+}
+
+float4 scale_rect(int mode, float scale_value)
+{
+    float s = max(scale_value, 0.000001);
+    float2 anchor = float2(0.5, 0.5);
+    float2 scale = float2(s, s);
+    if (mode == 1) { anchor = float2(0.0, 0.0); }
+    else if (mode == 2) { anchor = float2(1.0, 0.0); }
+    else if (mode == 3) { anchor = float2(0.0, 1.0); }
+    else if (mode == 4) { anchor = float2(1.0, 1.0); }
+    else if (mode == 5) { scale.x = 1.0; }
+    else if (mode == 6) { scale.y = 1.0; }
+    else if (mode == 7) { anchor = float2(0.0, 0.0); scale.x = 1.0; }
+    else if (mode == 8) { anchor = float2(0.0, 1.0); scale.x = 1.0; }
+    else if (mode == 9) { anchor = float2(0.0, 0.0); scale.y = 1.0; }
+    else if (mode == 10) { anchor = float2(1.0, 0.0); scale.y = 1.0; }
+    else if (mode == 11) {
+        anchor = float2(opt(2) / max(wu[0].z, 1.0), opt(3) / max(wu[0].w, 1.0));
+    }
+    return float4(anchor * (float2(1.0, 1.0) - scale), scale);
+}
+
+float4 scale_uv(int mode, float rate_in)
+{
+    float rate = rate_in;
+    float vrate = rate_in;
+    if (mode == 0) { return float4(0.5 - 0.5 * rate, 0.5 - 0.5 * vrate, rate, vrate); }
+    if (mode == 1) { return float4(0.0, 0.0, rate, vrate); }
+    if (mode == 2) { return float4(1.0 - rate, 0.0, rate, vrate); }
+    if (mode == 3) { return float4(0.0, 1.0 - vrate, rate, vrate); }
+    if (mode == 4) { return float4(1.0 - rate, 1.0 - vrate, rate, vrate); }
+    if (mode == 5) {
+        vrate = lerp(0.49, 1.0, clamp(vrate, 0.0, 1.0));
+        return float4(0.0, 1.0 - vrate, 1.0, 2.0 * vrate - 1.0);
+    }
+    if (mode == 6) {
+        rate = lerp(0.49, 1.0, clamp(rate, 0.0, 1.0));
+        return float4(1.0 - rate, 0.0, 2.0 * rate - 1.0, 1.0);
+    }
+    if (mode == 7) { return float4(0.0, 0.0, 1.0, vrate); }
+    if (mode == 8) { return float4(0.0, 1.0 - vrate, 1.0, vrate); }
+    if (mode == 9) { return float4(0.0, 0.0, rate, 1.0); }
+    if (mode == 10) { return float4(1.0 - rate, 0.0, rate, 1.0); }
+    if (mode == 11) {
+        float x = opt(2) / max(wu[0].z, 1.0);
+        float y = opt(3) / max(wu[0].w, 1.0);
+        return float4(x - x * rate, y - y * vrate, rate, vrate);
+    }
+    return float4(0.0, 0.0, 1.0, 1.0);
+}
+
+float4 sample_uv_box(sampler2D t, float2 uv, float4 box, float alpha)
+{
+    float2 sample_uv = box.xy + uv * box.zw;
+    float4 c = tex2D(t, clamp(sample_uv, 0.0, 1.0));
+    return float4(c.rgb, c.a * alpha);
+}
+
+float4 sample_mosaic(sampler2D t, float2 uv, float size)
+{
+    float2 dims = wu[0].zw;
+    float2 cell = max(float2(1.0, 1.0), float2(size, size));
+    float2 px = floor(uv * dims / cell) * cell + 0.5 * cell;
+    return tex2D(t, clamp(px / dims, 0.0, 1.0));
+}
+
+float4 explosion(sampler2D t, float2 uv, float2 center, float power)
+{
+    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+    float2 delta = (center - uv) * power / 16.0;
+    for (int i = 0; i < 16; i++) {
+        sum += tex2D(t, clamp(uv + delta * (float)i, 0.0, 1.0));
+    }
+    return sum / 16.0;
+}
+
+float2 raster_offset(float2 uv, bool vertical, float fraction, float wave, float power, float progress)
+{
+    float axis = vertical ? uv.y : uv.x;
+    float phase = axis * max(fraction, 1.0) * 6.28318530718 + progress * wave * 6.28318530718;
+    float amp = sin(phase) * power;
+    return vertical ? float2(0.0, amp) : float2(amp, 0.0);
+}
+
+float4 wipe_shimi_source(float4 color, float fade, float progress, bool reverse)
+{
+    float brightness = dot(float3(0.299, 0.587, 0.114), color.rgb);
+    bool hide = reverse ? brightness < 1.0 - progress : brightness > progress;
+    if (hide) {
+        color.a = color.a * max(fade * progress, 0.0);
+    }
+    return color;
+}
+
+float triangular_parameter(int kind, bool reverse, float progress)
+{
+    float value;
+    if (kind == 0) {
+        value = 1.0 - progress;
+    } else if (kind == 10) {
+        value = progress;
+    } else {
+        float threshold = clamp((float)kind / 10.0, 0.000001, 0.999999);
+        value = progress < threshold ? progress / threshold : (1.0 - progress) / (1.0 - threshold);
+    }
+    return clamp(reverse ? 1.0 - value : value, 0.0, 1.0);
+}
+
+float4 affected_color(float2 uv, sampler2D current_tex, sampler2D next_tex, sampler2D mask_tex)
+{
+    int kind = (int)round(wu[0].x);
+    float p = clamp(wu[0].y, 0.0, 1.0);
+    float4 current = tex2D(current_tex, uv);
+    float4 next = tex2D(next_tex, uv);
+
+    if (kind == 0) {
+        if (p <= 0.0) { return next; }
+        if (p >= 1.0) { return current; }
+        return lerp(next, current, p);
+    }
+    if (kind == 1) { return current; }
+    if (kind == 2) { return next; }
+
+    bool old_to_new_family =
+        (kind >= 5 && kind < 200) || kind == 900 || kind == 901 || kind == 220 || kind == 221;
+    if (old_to_new_family) {
+        if (p <= 0.0) { return next; }
+        if (p >= 1.0) { return current; }
+    } else {
+        if (p <= 0.0) { return current; }
+        if (p >= 1.0) { return next; }
+    }
+    if (kind == 200) {
+        // i32 `%` (truncated remainder); fragment programs have no
+        // integer division.
+        float whole = sign(opt(0)) * floor(abs(opt(0)));
+        int direction = (int)(whole - 4.0 * sign(whole) * floor(abs(whole) / 4.0));
+        int cmode = (int)opt(1);
+        int nmode = (int)opt(2);
+        float4 c = rect_sample(current_tex, uv, move_rect(direction, cmode, p, false), 1.0);
+        float4 n = rect_sample(next_tex, uv, move_rect(direction, nmode, p, true), 1.0);
+        return cmode == 0 ? alpha_over(c, n) : alpha_over(n, c);
+    }
+    if (kind == 210 || kind == 211) {
+        bool incoming = kind == 210;
+        float4 base = incoming ? next : current;
+        float4 rect = scale_rect((int)opt(0), incoming ? p : 1.0 - p);
+        bool fade = (int)opt(1) == 1;
+        float alpha = incoming ? (fade ? p : 1.0) : (fade ? 1.0 - p : 1.0);
+        float4 moving = incoming ? rect_sample(next_tex, uv, rect, alpha) : rect_sample(current_tex, uv, rect, alpha);
+        return alpha_over(base, moving);
+    }
+    if (kind == 212) {
+        if (p < 0.5) {
+            return sample_uv_box(current_tex, uv, scale_uv((int)opt(0), lerp(1.0, 0.001, p * 2.0)), 1.0);
+        }
+        return sample_uv_box(next_tex, uv, scale_uv((int)opt(0), lerp(0.001, 1.0, (p - 0.5) * 2.0)), 1.0);
+    }
+    if (kind == 213) {
+        float4 n = sample_uv_box(next_tex, uv, scale_uv((int)opt(0), lerp(0.333, 1.0, p)), p);
+        return alpha_over(current, n);
+    }
+    if (kind == 214) {
+        float4 c = sample_uv_box(current_tex, uv, scale_uv((int)opt(0), lerp(1.0, 0.333, p)), 1.0 - p);
+        return alpha_over(next, c);
+    }
+    if (kind == 215) {
+        float sx = clamp(opt(2) / max(wu[0].z, 1.0), 0.0, 1.0);
+        float sy = clamp(opt(3) / max(wu[0].w, 1.0), 0.0, 1.0);
+        float ex = clamp(opt(4) / max(wu[0].z, 1.0), 0.0, 1.0);
+        float ey = clamp(opt(5) / max(wu[0].w, 1.0), 0.0, 1.0);
+        float4 specified = float4(min(sx, ex), min(sy, ey),
+            max(abs(ex - sx), 1.0 / max(wu[0].z, 1.0)), max(abs(ey - sy), 1.0 / max(wu[0].w, 1.0)));
+        int alpha_mode = (int)opt(0);
+        float alpha = alpha_mode == 1 ? p : (alpha_mode == 2 ? 1.0 - p : 1.0);
+        if ((int)opt(1) == 0) {
+            float4 rect = lerp(specified, float4(0.0, 0.0, 1.0, 1.0), p);
+            return alpha_over(current, rect_sample(next_tex, uv, rect, alpha));
+        }
+        float4 rect = lerp(float4(0.0, 0.0, 1.0, 1.0), specified, p);
+        return alpha_over(next, rect_sample(current_tex, uv, rect, alpha));
+    }
+    if (kind == 220 || kind == 221) {
+        bool vertical = (int)opt(0) == 0;
+        float dim = vertical ? wu[0].w : wu[0].z;
+        float fraction = dim / max(opt(1), 1.0);
+        if (kind == 220) {
+            float2 offset = raster_offset(uv, vertical, fraction, opt(2), opt(3) / max(dim, 1.0), p);
+            float4 old_scene = sample_or_zero(next_tex, uv - offset * p);
+            float4 new_scene = sample_or_zero(current_tex, uv + offset * (1.0 - p));
+            return lerp(old_scene, new_scene, p);
+        }
+        bool reverse = (int)opt(4) != 0;
+        float t = reverse ? 1.0 - p : p;
+        float2 offset = raster_offset(uv, vertical, fraction, opt(2), opt(3) / max(dim, 1.0), t);
+        if (!reverse) {
+            float4 warped_new = sample_or_zero(current_tex, uv + offset * (1.0 - t));
+            return alpha_over(next, float4(warped_new.rgb, warped_new.a * t));
+        }
+        float4 warped_old = sample_or_zero(next_tex, uv + offset * (1.0 - t));
+        return alpha_over(current, float4(warped_old.rgb, warped_old.a * t));
+    }
+    if (kind == 230 || kind == 231) {
+        if (kind == 230) {
+            bool first = p < 0.5;
+            float local = first ? p * 2.0 : (p - 0.5) * 2.0;
+            float size = lerp(1.0, max(opt(0), 1.0), first ? local : 1.0 - local);
+            return first ? sample_mosaic(current_tex, uv, size) : sample_mosaic(next_tex, uv, size);
+        }
+        bool use_next = (int)opt(1) != 0;
+        float size = lerp(max(opt(0), 1.0), 1.0, p);
+        float4 src = use_next ? sample_mosaic(next_tex, uv, size) : sample_mosaic(current_tex, uv, size);
+        return float4(src.rgb, src.a * (use_next ? p : 1.0 - p));
+    }
+    if (kind >= 240 && kind <= 243) {
+        bool base_is_current = false;
+        if (kind == 241) { base_is_current = (int)opt(7) == 0; }
+        if (kind == 243) { base_is_current = (int)opt(5) == 0; }
+        bool processed_is_next = base_is_current;
+        float4 base = base_is_current ? current : next;
+        float4 processed = processed_is_next ? next : current;
+
+        bool first_pair = kind <= 241;
+        int alpha_type = (int)(first_pair ? opt(2) : opt(0));
+        bool alpha_reverse = (int)(first_pair ? opt(3) : opt(1)) != 0;
+        float visible_alpha = 1.0 - triangular_parameter(alpha_type, alpha_reverse, p);
+
+        int power_type = (int)(first_pair ? opt(4) : opt(2));
+        bool power_reverse = (int)(first_pair ? opt(5) : opt(3)) != 0;
+        float power = triangular_parameter(power_type, power_reverse, p);
+        float coefficient = max(first_pair ? opt(6) : opt(4), 0.0);
+
+        float2 center = float2(0.5, 0.5);
+        if (first_pair) {
+            center = float2(opt(0) / max(wu[0].z, 1.0), opt(1) / max(wu[0].w, 1.0));
+        } else {
+            float seed = opt(15);
+            center = frac(float2(sin(seed * 12.9898), sin(seed * 78.233)) * 43758.5453);
+        }
+        float4 blurred = processed_is_next
+            ? explosion(next_tex, uv, center, power * coefficient)
+            : explosion(current_tex, uv, center, power * coefficient);
+        float4 processed_color = float4(blurred.rgb, processed.a * visible_alpha);
+        return alpha_over(base, processed_color);
+    }
+    if (kind == 50) {
+        float4 processed = wipe_shimi_source(current, mask_fade((int)opt(0)), p, (int)opt(1) != 0);
+        return alpha_over(next, processed);
+    }
+    if (kind == 901) {
+        float max_root = sqrt(max(opt(1) / 1000.0, 0.000001));
+        float root_now = (int)opt(0) != 0 ? max_root * (1.0 - p) : max_root * p;
+        float scale = max(root_now * root_now, 0.000001);
+        float angle = radians(360.0 * opt(2) * p);
+        float cs = cos(angle);
+        float sn = sin(angle);
+        float2 d = uv - float2(0.5, 0.5);
+        float2 muv = float2(cs * d.x + sn * d.y, -sn * d.x + cs * d.y) / scale + float2(0.5, 0.5);
+        float cells = clamp(opt(3), 0.0, 64.0);
+        float mask_value = 1.0;
+        if (cells > 0.0) {
+            muv = frac(muv * cells);
+            if ((int)opt(4) != 0 && (muv.x < 0.03 || muv.y < 0.03 || muv.x > 0.97 || muv.y > 0.97)) {
+                mask_value = 1.0;
+            } else {
+                mask_value = luminance(tex2D(mask_tex, muv));
+            }
+        } else if (inside(muv)) {
+            mask_value = luminance(tex2D(mask_tex, muv));
+        }
+        return lerp(current, next, mask_value >= 0.5 ? 1.0 : 0.0);
+    }
+    if (kind == 900 || (kind >= 5 && kind < 200)) {
+        float mask_value = luminance(tex2D(mask_tex, uv));
+        float reveal = mask_reveal(p, 1.0 - mask_value, mask_fade((int)opt(0)));
+        return lerp(next, current, reveal);
+    }
+    return lerp(current, next, p);
+}
+
+float4 main(
+    float2 uv_in : TEXCOORD0,
+    uniform sampler2D under_tex : TEXUNIT0,
+    uniform sampler2D current_tex : TEXUNIT1,
+    uniform sampler2D next_tex : TEXUNIT2,
+    uniform sampler2D mask_tex : TEXUNIT3) : COLOR
+{
+    float2 uv = clamp(uv_in, 0.0, 1.0);
+    int kind = (int)round(wu[0].x);
+    if (kind == 0 || kind == 1 || kind == 2) {
+        return affected_color(uv, current_tex, next_tex, mask_tex);
+    }
+    float4 under = tex2D(under_tex, uv);
+    return alpha_over(under, affected_color(uv, current_tex, next_tex, mask_tex));
+}

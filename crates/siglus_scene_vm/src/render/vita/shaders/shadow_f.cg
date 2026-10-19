@@ -1,0 +1,12 @@
+// fs_shadow_map (render/shaders/sprite.wgsl fs_shadow_common): the depth of a
+// shadow caster, grey.
+uniform float4 vs[120];
+
+float4 main(float4 uv_depth : TEXCOORD0, uniform sampler2D tex0 : TEXUNIT0) : COLOR
+{
+    float4 base = tex2D(tex0, uv_depth.xy);
+    if ((uv_depth.w > 0.5 || base.a < 0.999) && base.a <= max(vs[30].y, 0.001)) {
+        discard;
+    }
+    return float4(uv_depth.z, uv_depth.z, uv_depth.z, 1.0);
+}

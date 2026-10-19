@@ -1,0 +1,398 @@
+// fs_common (render/shaders/sprite.wgsl): 3D meshes with the tona3 lighting
+// models, then the shared CFX colour sequence.
+//
+// vs[120]  VsUniform (mesh.cgh)
+// mx[0]    normal map size, toon map size (1x1: none)
+// mx[1]    fog texture size, tex0 size
+// mx[2]    tex3 size
+#include "mesh.cgh"
+#include "sprite.cgh"
+
+uniform float4 vs[120];
+uniform float4 mx[3];
+
+float3 sample_normal_tex(sampler2D tex5, float2 uv)
+{
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) {
+        return float3(0.5, 0.5, 1.0);
+    }
+    if (mx[0].x <= 1.0 && mx[0].y <= 1.0) {
+        return float3(0.5, 0.5, 1.0);
+    }
+    return tex2D(tex5, uv).xyz;
+}
+
+float3 sample_toon_tex(sampler2D tex6, float value)
+{
+    float u = clamp(value, 0.0, 1.0);
+    if (mx[0].z <= 1.0 && mx[0].w <= 1.0) {
+        float q = floor(u * 4.0) / 3.0;
+        return float3(q, q, q);
+    }
+    return tex2D(tex6, float2(u, 0.5)).rgb;
+}
+
+void tangent_frame(float3 base_n, float3 base_t, float3 base_b, out float3 N, out float3 T, out float3 B)
+{
+    N = normalize(base_n);
+    T = normalize(base_t);
+    B = normalize(base_b);
+    if (length(T) <= 1e-5 || length(B) <= 1e-5) {
+        float3 up = abs(N.z) > 0.9 ? float3(0.0, 1.0, 0.0) : float3(0.0, 0.0, 1.0);
+        T = normalize(cross(up, N));
+        B = normalize(cross(N, T));
+    }
+}
+
+float2 apply_parallax_uv(sampler2D tex5, float3 base_n, float3 base_t, float3 base_b, float2 uv, float3 view_dir_world, float max_height)
+{
+    if ((mx[0].x <= 1.0 && mx[0].y <= 1.0) || max_height <= 1e-6) {
+        return uv;
+    }
+    float3 N;
+    float3 T;
+    float3 B;
+    tangent_frame(base_n, base_t, base_b, N, T, B);
+    float3 Vt = float3(dot(view_dir_world, T), dot(view_dir_world, B), dot(view_dir_world, N));
+    float height = tex2D(tex5, uv).a;
+    float denom = abs(Vt.z) > 1e-4 ? Vt.z : -1e-4;
+    float shift = (height - 0.5) * max_height;
+    return uv + (Vt.xy / denom) * shift;
+}
+
+float3 apply_normal_map(sampler2D tex5, float3 base_n, float3 base_t, float3 base_b, float2 uv)
+{
+    float3 tex_n = sample_normal_tex(tex5, uv) * 2.0 - float3(1.0, 1.0, 1.0);
+    float3 N;
+    float3 T;
+    float3 B;
+    tangent_frame(base_n, base_t, base_b, N, T, B);
+    return normalize(T * tex_n.x + B * tex_n.y + N * tex_n.z);
+}
+
+float sample_shadow_visibility(sampler2D shadow_tex, float4 shadow_pos)
+{
+    float3 ndc = shadow_pos.xyz / max(abs(shadow_pos.w), 1e-5);
+    float2 uv = float2(ndc.x * 0.5 + 0.5, 1.0 - (ndc.y * 0.5 + 0.5));
+    if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) {
+        return 1.0;
+    }
+    float current = clamp(ndc.z, 0.0, 1.0);
+    float stored = tex2D(shadow_tex, uv).r;
+    float bias = max(vs[VS_MESH_MISC].y, 0.0);
+    return current - bias <= stored ? 1.0 : 0.0;
+}
+
+float3 mesh_light_contrib(
+    sampler2D tex6, sampler2D shadow_tex,
+    float3 base_rgb, float3 world_pos, float3 N,
+    float3 light_diffuse, float3 light_ambient, float3 light_specular,
+    int kind, float3 light_pos, float3 light_dir, float4 light_atten, float4 light_cone,
+    float4 shadow_pos, bool shadow_enabled)
+{
+    int lighting_type = (int)round(vs[VS_MTRL_PARAMS].y);
+    int shading_type = (int)round(vs[VS_MTRL_PARAMS].z);
+    float3 mtrl_ambient = vs[VS_MTRL_AMBIENT].rgb;
+    float3 mtrl_specular = vs[VS_MTRL_SPECULAR].rgb;
+    float mtrl_power = max(vs[VS_MTRL_PARAMS].x, 1.0);
+
+    float3 L = normalize(-light_dir);
+    float distance_attenuation = 1.0;
+    float spot_power = 1.0;
+    if (kind != 0) {
+        float3 dir_point = light_pos - world_pos;
+        float distance_point = max(length(dir_point), 1e-5);
+        L = dir_point / distance_point;
+        distance_attenuation = 1.0 / max(
+            light_atten.x + light_atten.y * distance_point + light_atten.z * distance_point * distance_point,
+            1e-5);
+        if (light_atten.w > 0.0) {
+            distance_attenuation = distance_attenuation * clamp(1.0 - distance_point / light_atten.w, 0.0, 1.0);
+        }
+        if (kind >= 2) {
+            float rho = dot(L, normalize(-light_dir));
+            if (rho >= light_cone.x) {
+                spot_power = 1.0;
+            } else if (rho <= light_cone.y) {
+                spot_power = 0.0;
+            } else {
+                spot_power = pow((rho - light_cone.y) / max(light_cone.x - light_cone.y, 1e-5), max(light_cone.z, 0.01));
+            }
+        }
+    }
+
+    float3 V = normalize(vs[VS_CAMERA_EYE].xyz - world_pos);
+    float3 H = normalize(L + V);
+    float ndotl_raw = dot(N, L);
+    float ndotl = max(ndotl_raw, 0.0);
+    float half_lambert = pow(clamp(ndotl_raw * 0.5 + 0.5, 0.0, 1.0), 2.0);
+    float ndoth = max(dot(N, H), 0.0);
+    float rdotv = max(dot(reflect(-L, N), V), 0.0);
+
+    float visibility = 1.0;
+    if (shadow_enabled && (shading_type == 1 || kind == 3)) {
+        visibility = sample_shadow_visibility(shadow_tex, shadow_pos);
+    }
+
+    float3 ambient_term = base_rgb * mtrl_ambient * light_ambient;
+    float diffuse_strength = lighting_type == 4 ? half_lambert : ndotl;
+    float3 diffuse_term = base_rgb * light_diffuse * diffuse_strength * distance_attenuation * spot_power;
+    if (lighting_type == 5) {
+        float3 lbrightness = light_ambient + light_diffuse * diffuse_strength * distance_attenuation * spot_power;
+        float toon = 0.0001 + (lbrightness.x + lbrightness.y + lbrightness.z) * 0.333;
+        diffuse_term = base_rgb * sample_toon_tex(tex6, toon);
+    }
+
+    float specular_strength = pow(ndoth, mtrl_power);
+    if (lighting_type == 6 || lighting_type == 7) {
+        specular_strength = pow(rdotv, mtrl_power);
+    }
+    if (lighting_type == 0 || lighting_type == 1 || lighting_type == 4 || lighting_type == 5) {
+        specular_strength = 0.0;
+    }
+    float specular_spot = lighting_type == 7 ? 1.0 : spot_power;
+    float3 specular_term = mtrl_specular * light_specular * specular_strength * distance_attenuation * specular_spot;
+    return ambient_term + (diffuse_term + specular_term) * visibility;
+}
+
+float3 mesh_lighting(
+    sampler2D tex5, sampler2D tex6, sampler2D shadow_tex,
+    float3 base_rgb, float3 world_pos, float3 world_normal, float3 world_tangent, float3 world_binormal,
+    float2 shaded_uv, float4 shadow_pos)
+{
+    int lighting_type = (int)round(vs[VS_MTRL_PARAMS].y);
+    float rim_power = max(vs[VS_MTRL_PARAMS].w, 0.0);
+    float3 N = normalize(world_normal);
+    if (lighting_type == 8 || lighting_type == 9) {
+        N = apply_normal_map(tex5, N, world_tangent, world_binormal, shaded_uv);
+    }
+
+    float3 accum = vs[VS_MTRL_EMISSIVE].rgb;
+    int dir_count = (int)round(vs[VS_MESH_LIGHT_COUNTS].x);
+    int point_count = (int)round(vs[VS_MESH_LIGHT_COUNTS].y);
+    int spot_count = (int)round(vs[VS_MESH_LIGHT_COUNTS].z);
+    if (dir_count + point_count + spot_count > 0) {
+        for (int li = 0; li < 4; li++) {
+            if (li < dir_count) {
+                accum += mesh_light_contrib(tex6, shadow_tex, base_rgb, world_pos, N,
+                    vs[VS_DIR_DIFFUSE + li].rgb, vs[VS_DIR_AMBIENT + li].rgb, vs[VS_DIR_SPECULAR + li].rgb,
+                    0, float3(0.0, 0.0, 0.0), vs[VS_DIR_DIR + li].xyz,
+                    float4(1.0, 0.0, 0.0, 0.0), float4(0.0, 0.0, 0.0, 0.0), shadow_pos, false);
+            }
+            if (li < point_count) {
+                accum += mesh_light_contrib(tex6, shadow_tex, base_rgb, world_pos, N,
+                    vs[VS_POINT_DIFFUSE + li].rgb, vs[VS_POINT_AMBIENT + li].rgb, vs[VS_POINT_SPECULAR + li].rgb,
+                    1, vs[VS_POINT_POS + li].xyz, float3(0.0, 0.0, -1.0),
+                    vs[VS_POINT_ATTEN + li], float4(0.0, 0.0, 0.0, 0.0), shadow_pos, false);
+            }
+            if (li < spot_count) {
+                bool receives_shadow = vs[VS_SPOT_CONE + li].w > 0.5;
+                accum += mesh_light_contrib(tex6, shadow_tex, base_rgb, world_pos, N,
+                    vs[VS_SPOT_DIFFUSE + li].rgb, vs[VS_SPOT_AMBIENT + li].rgb, vs[VS_SPOT_SPECULAR + li].rgb,
+                    receives_shadow ? 3 : 2, vs[VS_SPOT_POS + li].xyz, vs[VS_SPOT_DIR + li].xyz,
+                    vs[VS_SPOT_ATTEN + li], vs[VS_SPOT_CONE + li], shadow_pos, receives_shadow);
+            }
+        }
+    } else {
+        int kind = (int)round(vs[VS_SINGLE_LIGHT_POS_KIND].w);
+        accum += mesh_light_contrib(tex6, shadow_tex, base_rgb, world_pos, N,
+            vs[VS_LIGHT_DIFFUSE].rgb, vs[VS_LIGHT_AMBIENT].rgb, vs[VS_LIGHT_SPECULAR].rgb,
+            kind, vs[VS_SINGLE_LIGHT_POS_KIND].xyz, vs[VS_SINGLE_LIGHT_DIR_SHADOW].xyz,
+            vs[VS_SINGLE_LIGHT_ATTEN], vs[VS_SINGLE_LIGHT_CONE], shadow_pos,
+            kind == 3 && vs[VS_SINGLE_LIGHT_DIR_SHADOW].w > 0.5);
+    }
+
+    int shader_option_bits = (int)round(vs[VS_MTRL_EXTRA].z);
+    if (rim_power > 0.0 && fmod((float)shader_option_bits, 2.0) >= 1.0) {
+        float3 V = normalize(vs[VS_CAMERA_EYE].xyz - world_pos);
+        float rim = pow(clamp(1.0 - max(dot(N, V), 0.0), 0.0, 1.0), max(rim_power, 1e-3));
+        accum += vs[VS_MTRL_RIM].rgb * rim;
+    }
+    return accum;
+}
+
+float4 main(
+    float4 uv_alpha : TEXCOORD0,
+    float4 vertex_color : TEXCOORD1,
+    float4 world_pos_in : TEXCOORD2,
+    float4 world_normal_in : TEXCOORD3,
+    float4 world_tangent_in : TEXCOORD4,
+    float4 world_binormal_in : TEXCOORD5,
+    float4 shadow_pos : TEXCOORD6,
+    float4 proj_pos : TEXCOORD7,
+    uniform sampler2D tex0 : TEXUNIT0,
+    uniform sampler2D tex1 : TEXUNIT1,
+    uniform sampler2D tex2 : TEXUNIT2,
+    uniform sampler2D tex3 : TEXUNIT3,
+    uniform sampler2D tex4 : TEXUNIT4,
+    uniform sampler2D tex5 : TEXUNIT5,
+    uniform sampler2D tex6 : TEXUNIT6,
+    uniform sampler2D shadow_tex : TEXUNIT7) : COLOR
+{
+    float4 e1 = vs[VS_EFFECTS + 0];
+    float4 e2 = vs[VS_EFFECTS + 1];
+    float4 e3 = vs[VS_EFFECTS + 2];
+    float4 e4 = vs[VS_EFFECTS + 3];
+    float4 e5 = vs[VS_EFFECTS + 4];
+    float4 e6 = vs[VS_EFFECTS + 5];
+    float4 e7 = vs[VS_EFFECTS + 6];
+    float4 e8 = vs[VS_EFFECTS + 7];
+    float4 e9 = vs[VS_EFFECTS + 8];
+    float4 e10 = vs[VS_EFFECTS + 9];
+    float4 e11 = vs[VS_EFFECTS + 10];
+    float2 uv = uv_alpha.xy;
+    float alpha_in = uv_alpha.z;
+
+    float tr = e1.x;
+    float mask_mode = e4.x;
+    float alpha_test = e4.y;
+    float light_on = e4.z;
+    float fog_on = e4.w;
+    float has_mask = e5.x;
+    float tonecurve_row = e5.z;
+    float wipe_mode = e6.x;
+    float wipe_p0 = e6.y;
+    float wipe_p1 = e6.z;
+    float wipe_p2 = e6.w;
+    float wipe_p3 = e7.x;
+    float has_wipe_src = e7.y;
+    float blend_code = e7.z;
+    float wipe_aux1 = e7.w;
+    float light_factor = e8.w;
+    float fog_scroll_x = e9.w;
+    float4 fog_color_fallback = float4(e10.xyz, 1.0);
+    float fog_near = e11.x;
+    float fog_far = e11.y;
+    float has_fog_tex = e11.z;
+    float alpha_ref = max(vs[VS_MTRL_EXTRA].y, 1.0 / 255.0);
+    float2 tex0_size = mx[1].zw;
+    float2 tex3_size = mx[2].xy;
+
+    float3 world_pos = world_pos_in.xyz;
+    bool world_has_pos = world_pos_in.w > 0.5;
+    float3 world_normal = world_normal_in.xyz;
+    float3 world_tangent = world_tangent_in.xyz;
+    float3 world_binormal = world_binormal_in.xyz;
+    bool mesh_pipeline = vs[VS_FLAGS].x > 0.5;
+    bool mesh_use_tex = vs[VS_MESH_FLAGS].x > 0.5;
+    bool mesh_use_mrbd = vs[VS_MESH_FLAGS].y > 0.5;
+    bool mesh_use_rgb = vs[VS_MESH_FLAGS].z > 0.5;
+    bool mesh_use_vertex_color = vs[VS_MESH_FLAGS].w > 0.5;
+
+    float2 shaded_uv = uv;
+    if (mesh_pipeline && world_has_pos && length(world_normal) > 0.25 && (int)round(vs[VS_MTRL_PARAMS].y) == 9) {
+        float3 view_dir_world = normalize(vs[VS_CAMERA_EYE].xyz - world_pos);
+        shaded_uv = apply_parallax_uv(tex5, world_normal, world_tangent, world_binormal, uv, view_dir_world, max(vs[VS_MTRL_EXTRA].x, 0.0));
+    }
+
+    float4 c = mesh_use_tex ? tex2D(tex0, shaded_uv) : float4(1.0, 1.0, 1.0, 1.0);
+    if (wipe_mode < 0.5) {
+    } else if (wipe_mode < 1.5) {
+        c = sample_mosaic(tex0, uv, wipe_p0, wipe_p1);
+        c.a = 1.0;
+    } else if (wipe_mode < 2.5) {
+        c = sample_raster_h(tex0, uv, wipe_p0, wipe_p1, wipe_p2, wipe_p3);
+    } else if (wipe_mode < 3.5) {
+        c = sample_raster_v(tex0, uv, wipe_p0, wipe_p1, wipe_p2, wipe_p3);
+    } else if (wipe_mode < 4.5) {
+        c = sample_explosion_blur(tex0, tex0_size, uv, float2(wipe_p0, wipe_p1), wipe_p2, wipe_p3);
+        c.a = 1.0;
+    } else if (wipe_mode < 5.5) {
+        c = sample_shimi(tex0, uv, wipe_p0, wipe_p1, false);
+    } else if (wipe_mode < 6.5) {
+        c = sample_shimi(tex0, uv, wipe_p0, wipe_p1, true);
+    } else if (wipe_mode > 9.5 && wipe_mode < 10.5 && has_wipe_src > 0.5) {
+        float4 oldc = sample_mosaic(tex3, uv, wipe_p0, wipe_p1);
+        float4 newc = sample_mosaic(tex0, uv, wipe_p0, wipe_p1);
+        if (wipe_p3 < 230.5) {
+            c = wipe_p2 >= 0.5 ? newc : oldc;
+        } else {
+            c = lerp(wipe_aux1 < 0.5 ? oldc : newc, wipe_aux1 < 0.5 ? newc : oldc, clamp(wipe_p2, 0.0, 1.0));
+        }
+    } else if (wipe_mode > 10.5 && wipe_mode < 11.5 && has_wipe_src > 0.5) {
+        c = lerp(sample_raster_h(tex3, uv, wipe_p0, wipe_p1, wipe_p2, wipe_p3),
+            sample_raster_h(tex0, uv, wipe_p0, wipe_p1, wipe_p2, wipe_p3), clamp(wipe_p3, 0.0, 1.0));
+    } else if (wipe_mode > 11.5 && wipe_mode < 12.5 && has_wipe_src > 0.5) {
+        c = lerp(sample_raster_v(tex3, uv, wipe_p0, wipe_p1, wipe_p2, wipe_p3),
+            sample_raster_v(tex0, uv, wipe_p0, wipe_p1, wipe_p2, wipe_p3), clamp(wipe_p3, 0.0, 1.0));
+    } else if (wipe_mode > 12.5 && wipe_mode < 13.5 && has_wipe_src > 0.5) {
+        c = lerp(sample_explosion_blur(tex3, tex3_size, uv, float2(wipe_p0, wipe_p1), wipe_p2, wipe_p3),
+            sample_explosion_blur(tex0, tex0_size, uv, float2(wipe_p0, wipe_p1), wipe_p2, wipe_p3),
+            clamp(tonecurve_row, 0.0, 1.0));
+        c.a = 1.0;
+    }
+
+    float4 color = c * float4(1.0, 1.0, 1.0, alpha_in * tr);
+    if (mesh_pipeline) {
+        color = color * vs[VS_MTRL_DIFFUSE];
+        if (mesh_use_vertex_color) {
+            color = color * lerp(float4(1.0, 1.0, 1.0, 1.0), vertex_color, clamp(vs[VS_MESH_MISC].x, 0.0, 1.0));
+        }
+    }
+    float4 color_org = color;
+
+    if (light_on > 0.5) {
+        if (mesh_pipeline && world_has_pos && length(world_normal) > 0.25) {
+            color.rgb = mesh_lighting(tex5, tex6, shadow_tex, color.rgb, world_pos, world_normal,
+                world_tangent, world_binormal, shaded_uv, shadow_pos);
+        } else {
+            color = color * float4(e9.xyz, 1.0) * light_factor;
+        }
+    } else if (mesh_pipeline) {
+        color.rgb = color.rgb + vs[VS_MTRL_EMISSIVE].rgb;
+    }
+
+    if (fog_on > 0.5) {
+        float depth = abs(e10.w - e11.w);
+        if (world_has_pos) {
+            depth = length(vs[VS_CAMERA_EYE].xyz - world_pos);
+        }
+        float fog_t = clamp((depth - fog_near) / max(fog_far - fog_near, 1e-5), 0.0, 1.0);
+        if (fog_t > 0.0) {
+            float4 fog_color = fog_color_fallback;
+            if (has_fog_tex > 0.5) {
+                float tw = max(mx[1].x, 1.0);
+                float th = max(mx[1].y, 1.0);
+                float vw = max(vs[VS_CAMERA_PARAMS].z, 1.0);
+                float vh = max(vs[VS_CAMERA_PARAMS].w, 1.0);
+                float aspect = th / vh;
+                float fog_w = vw / tw * aspect;
+                float fog_h = vh / th;
+                float fog_x = -fog_scroll_x / tw * aspect - 0.5 / vw;
+                float fog_y = 0.5 / vh;
+                float2 ndc = proj_pos.xy / max(abs(proj_pos.w), 1e-5);
+                float2 fog_base = float2((ndc.x + 1.0) * 0.5 * fog_w + fog_x, 1.0 - (ndc.y + 1.0) * 0.5);
+                float2 fog_uv = fog_base * fog_h + float2(fog_y, fog_y);
+                fog_color = tex2D(tex4, fog_uv);
+            }
+            color = lerp(color, fog_color, fog_t);
+        }
+    }
+
+    if (mesh_use_mrbd) {
+        float mesh_mono_y = dot(color.rgb, LUMA);
+        color.rgb = lerp(color.rgb, float3(1.0, 1.0, 1.0) - color.rgb, vs[VS_MESH_MRBD].y);
+        color.rgb = lerp(color.rgb, float3(mesh_mono_y, mesh_mono_y, mesh_mono_y), vs[VS_MESH_MRBD].x);
+        color.rgb = color.rgb + float3(vs[VS_MESH_MRBD].z, vs[VS_MESH_MRBD].z, vs[VS_MESH_MRBD].z);
+        color.rgb = color.rgb - float3(vs[VS_MESH_MRBD].w, vs[VS_MESH_MRBD].w, vs[VS_MESH_MRBD].w);
+    }
+    if (mesh_use_rgb) {
+        color.rgb = lerp(color.rgb, vs[VS_MESH_RGB_RATE].xyz, vs[VS_MESH_RGB_RATE].w);
+        color.rgb = color.rgb + vs[VS_MESH_ADD_RGB].xyz;
+    }
+
+    color = cfx_color(tex2, color, e1, e2, e3, e5);
+    color = blend_identity_fade(color, blend_code, color_org.a);
+
+    float final_gray = dot(color.rgb, LUMA);
+    if (has_mask > 0.5) {
+        color = color * tex2D(tex1, uv);
+    }
+    if (mask_mode > 0.5 && mask_mode < 1.5) {
+        color.a = final_gray;
+    }
+    if (alpha_test > 0.5 && color.a < alpha_ref) {
+        discard;
+    }
+    return color;
+}

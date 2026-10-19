@@ -1,0 +1,5 @@
+// A position already in clip space (clears, stencil masks).
+void main(float4 clip_position, out float4 out_pos : POSITION)
+{
+    out_pos = clip_position;
+}
