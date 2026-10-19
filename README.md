@@ -1,5 +1,7 @@
 # Sayooshi-iOS
 
+**原引擎作者与贡献者： [xmoezzz / siglus_rs contributors](https://github.com/xmoezzz/siglus_rs)。本项目是在其引擎之上的兼容性修正分支。** 参考实现、作者署名及本分支贡献范围详见 [CREDITS.md](CREDITS.md)。
+
 《さよならを教えて／对你说再见》旧版 AVG32 中文资源的原生运行器兼容性分支，基于 [xmoezzz/siglus_rs](https://github.com/xmoezzz/siglus_rs)。包含 Windows 统一运行器、iOS 启动器，以及中文替换字库、历史记录和菜单字体修正。
 
 **本仓库只提供引擎源码、测试和构建工具，不提供游戏本体、汉化资源、游戏字库、存档或 Apple 签名凭据。** 使用者需自行合法取得匹配的游戏和补丁。项目与游戏权利人、原汉化组无隶属或授权背书关系。
